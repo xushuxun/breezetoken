@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+.venv.broken
+
+# Tool caches
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
+.tilelang/
+.tilelang-cache/
+
+# Local models / artifacts
+*.gguf

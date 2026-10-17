@@ -1,3 +1,6 @@
+> **Legacy example.** This directory documents the pre-refactor Qwen3-0.6B engines.
+> It is not part of the `breezetoken` package and is not covered by the new test suite.
+
 # Qwen3-0.6B on breezetoken — 移植自 TileFoundry 示例
 
 从 TileFoundry `examples/qwen3_1_7b-tilelang`（MIT，见 `LICENSE.tilefoundry`）移植的

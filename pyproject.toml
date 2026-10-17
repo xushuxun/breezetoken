@@ -2,18 +2,66 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[project]
+name = "breezetoken"
+version = "0.2.0"
+description = "Local LLM inference engine: GGUF, tilelang kernels, OpenAI-compatible server"
+readme = "README.md"
+license-files = ["NOTICE", "LICENSES/*"]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "jinja2>=3.1",
+    "numpy>=1.26",
+    "pydantic>=2.7",
+    "tilelang>=0.1.15",
+    "tokenizers>=0.20",
+    "torch>=2.4",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "safetensors>=0.4",
+    "transformers>=4.57",
+]
+
+[project.scripts]
+breezetoken = "breezetoken.generate:main"
+breezetoken-server = "breezetoken.server:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["breezetoken"]
 
-[project]
-name = "breezetoken"
-version = "0.1.0"
-description = "Fast local llm inference engine"
-readme = "README.md"
-requires-python = ">=3.14"
-dependencies = [
-    "safetensors>=0.8.0",
-    "tilelang>=0.1.15",
-    "tokenizers>=0.23.3",
-    "torch>=2.14",
+[tool.hatch.build.targets.sdist]
+include = ["breezetoken", "tests", "docs", "LICENSES", "README.md", "NOTICE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore:.*type_params.*:DeprecationWarning",
 ]
+markers = [
+    "slow: runs model inference (deselect with -m 'not slow')",
+    "integration: needs local model weights / GPU",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["examples/qwen3_0_6b"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+"examples/*" = ["E402", "F401"]
+"breezetoken/kernels/**" = ["E741"]
