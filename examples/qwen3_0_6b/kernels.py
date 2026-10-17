@@ -43,7 +43,9 @@ DT = "bfloat16"
 ACC = "float32"
 NEG = -1.0e30
 
-tilelang.disable_cache()
+# The upstream example disables tilelang's persistent disk cache; we keep it
+# ENABLED so repeat runs load compiled .so artifacts instead of recompiling
+# (~20s -> ~1s startup). Clear ~/.tilelang/cache after changing kernel source.
 
 
 @lru_cache(maxsize=None)

@@ -321,3 +321,33 @@ class Engine:
 
         out = self.sam[pl - 1: pl - 1 + max_new].tolist()
         return Generated(out, t2 - t1, t1 - t0, pl)
+
+    def logits_for(self, prompt_ids: list[int]) -> torch.Tensor:
+        """The logits after consuming every token of *prompt_ids* -- for checking."""
+        self._reset()
+        self.inp.zero_()
+        self.inp[: len(prompt_ids)] = torch.tensor(
+            prompt_ids, device=self.device, dtype=torch.int32
+        )
+        self.plen.fill_(len(prompt_ids))
+        self.ids.fill_(prompt_ids[0])
+        for _ in range(len(prompt_ids)):
+            self.graph.replay()
+        torch.cuda.synchronize(self.device)
+        return self.logits.clone()
+
+    def trace(self, prompt_ids: list[int]) -> list[torch.Tensor]:
+        """Per-layer hidden states at the last prompt position."""
+        self._reset()
+        self.inp.zero_()
+        self.inp[: len(prompt_ids)] = torch.tensor(
+            prompt_ids, device=self.device, dtype=torch.int32
+        )
+        self.plen.fill_(len(prompt_ids))
+        self.ids.fill_(prompt_ids[0])
+        for _ in range(len(prompt_ids) - 1):
+            self.graph.replay()
+        rec: list[torch.Tensor] = []
+        self._step(record=rec)
+        torch.cuda.synchronize(self.device)
+        return rec
