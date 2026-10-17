@@ -62,15 +62,25 @@ attention 使用 `torch.nn.functional.scaled_dot_product_attention(enable_gqa=Tr
 | GEMV | ✅ `kernels/cpu/gemv.py` | ✅ `kernels/cuda/gemv.py` | 投影；bf16 CUDA split-K |
 | RMSNorm | ✅ 每行一个 block | ✅ 每行一个 block | f32；覆盖 flat / per-head / GDN |
 | SiLU× | ✅ | ✅ | f32，两输入 |
-| RoPE | torch | torch | partial RoPE |
-| attention | torch SDPA | torch SDPA | GQA；无 CUDA attention kernel |
-| GDN 递归 | torch | torch | 下一步 kernel 化的重点 |
+| RoPE | torch | ✅ `kernels/cuda/rope.py` | partial RoPE；pos 为 device int32 |
+| attention | torch SDPA | torch SDPA | GQA；profile 显示不是当前瓶颈，暂未替换 |
+| GDN 递归 | torch | ✅ `kernels/cuda/gdn.py` | TileOPs delta-rule decode 移植；f32 状态原地更新 |
+| fused add+RMSNorm | ✅ | ✅ | 残差与下一层 norm 合并为一次读 |
 | lm_head | GEMV | GEMV | 未融合 argmax |
+
+权重在加载期做两项融合：attention 的 `[q|k|v]` 是一次 GEMV，MLP 的
+`[gate|up]` 也是一次 GEMV；它们只改变启动次数，不改变每个输出列的算术。
 
 `TilelangBackend` 在 shape/dtype 没有 kernel 时回退 torch；例如 CUDA 上
 `ssm_alpha/ssm_beta` 的 N=16 走 torch 小 matvec，GPU 上 K 不在 TILES 的投影也会
 回退。CPU 的 C 后端是单线程，`auto` 因此在 CPU 选择 torch；`--backend tilelang`
 用于验证 kernel。
+
+CUDA 路径已在 RTX 4060 Laptop（8GB，CUDA 13.0）上验证：kernel 单元测试、完整
+模型 greedy 16/16 对齐 HF f32、HTTP 服务流式/非流式均通过。128 token greedy
+约 52 tok/s decode（TTFT 约 93ms，`max_context=4096`），峰值显存约 1.66GB；
+首次 JIT 约 20s。该数字仍低于旧 Qwen3-0.6B 的 188 tok/s，原因是 attention 仍是
+torch 且没有 CUDA graph。
 
 ## 4. 内存
 
@@ -129,10 +139,11 @@ kernel 融合），但它是四套手写执行序列，且 `llvm_backend.py` 通
 
 ## 9. 路线
 
-1. **Kernel 化**：RoPE、attention、GDN 的 torch 路径逐项搬到 CPU/CUDA；
+1. **Kernel 化**：attention 的 torch 路径搬到 CPU/CUDA（RoPE/GDN 已完成）；
 2. **可捕获执行**：固定 buffer、device `Pos`、全容量掩码 attention、采样进图，
    把旧引擎的 CUDA graph 能力接回新架构；
 3. **Prefill**：batched prefill 与 KV/prefix 复用；
 4. **量化**：直接 Q8_0 GEMV，降低权重带宽；
 5. **平台**：在独立虚拟环境验证 LLVM CPU 后端（通过 `TVM_LIBRARY_PATH`，不改
-   site-packages）；GPU 端按目标卡重测 TILES。
+   site-packages）；CUDA TILES 目前按 RTX 4060 的 99KB shared memory 选择，换卡
+   需要重新测量。

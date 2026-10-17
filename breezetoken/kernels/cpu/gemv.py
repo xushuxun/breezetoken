@@ -1,7 +1,5 @@
 """CPU GEMV: ``O = X @ W`` with W row-major ``(K, N)``."""
 
-from __future__ import annotations
-
 from functools import cache
 
 import tilelang

@@ -18,8 +18,9 @@ CPU/CUDA kernel、OpenAI 兼容 HTTP API 和一个零依赖的网页聊天前端
   `<think>\n\n</think>\n\n` 空思考块、system / assistant / tool 消息。
 - **后端**：`torch`（纯参考实现，完全不 import tilelang）与 `tilelang`（CPU
   `target="c"` / CUDA bf16）。`auto` 在 CUDA 选 tilelang，在 CPU 选更快的 torch。
-- **Kernel**：CPU/CUDA 的 GEMV、RMSNorm、SiLU；RoPE、attention（PyTorch SDPA +
-  GQA）和 GDN 递归暂时保持 torch，便于对拍。
+- **Kernel**：CPU/CUDA 的 GEMV、RMSNorm、SiLU、fused add+RMSNorm，以及 CUDA 的
+  RoPE 和 GDN decode（TileOPs 的 delta-rule decode 移植，已在 RTX 4060 上验证）；
+  attention 仍使用 PyTorch SDPA，因为 profile 显示它不是当前瓶颈。
 - **流式**：增量 UTF-8 解码（不会在 token 边界产生 `�`）、stop 序列、EOS、
   断开取消；单 worker executor 串行化模型访问。
 - **服务**：`/v1/chat/completions` 与 `/v1/completions`，流式/非流式、真实
@@ -117,14 +118,20 @@ for token in engine.generate_stream(engine.encode("Hello"), 16):
 | `auto` | CUDA | bf16 | 优先 tilelang |
 | `auto` | CPU | f32 | 选择 torch（单线程 C kernel 慢于 torch 的向量化 matmul） |
 
-本机 CPU（WSL2，无 CUDA）短 prompt、greedy 实测：
+本机实测（WSL2，RTX 4060 Laptop 8GB，torch 2.14.1+cu130，短 prompt、greedy）：
 
-- `torch` CPU：约 **6–7 tok/s**（0.8B f32）；
-- `tilelang` CPU：约 **2.3 tok/s**（单线程 C 后端，首次 JIT 约 10s）；
-- 模型加载约 **5s**（OS 页缓存命中时）。
+| 配置 | 结果 |
+|---|---|
+| `torch` CPU | 约 **6–7 tok/s**（0.8B f32） |
+| `tilelang` CPU | 约 **2.3 tok/s**（单线程 C 后端，首次 JIT 约 10s） |
+| `tilelang` CUDA | 约 **52 tok/s** decode（128 token；TTFT 约 93ms；`max_context=4096`） |
+| CUDA 显存 | 峰值约 **1.66 GB** |
+| CUDA 正确性 | 16 token greedy 与 HF f32 **16/16** 一致 |
+| 模型加载 | 约 **4–6s**（OS 页缓存命中） |
 
-GPU 数字需在目标机器上重新测量；本项目不再沿用旧 Qwen3-0.6B 示例的 188 tok/s
-数据。
+CUDA 首次运行需要 JIT 编译 14 个 kernel 形状，约 20s；之后走
+`TILELANG_CACHE_DIR` 缓存。旧 Qwen3-0.6B 示例的 188 tok/s 是完整 kernel 融合 +
+CUDA graph 的成绩，当前版本还没有把这些能力迁移完，不能直接对比。
 
 ## 测试
 
@@ -136,6 +143,9 @@ BREEZETOKEN_TEST_MODEL=/path/to/Qwen3.5-0.8B-Q8_0.gguf uv run pytest
 
 # 额外编译并运行 CPU tilelang kernel 对比
 BREEZETOKEN_TEST_TILELANG=1 uv run pytest tests/test_model.py
+
+# CUDA kernel 每次有 GPU 都会跑；完整 CUDA 模型需要显式开启
+BREEZETOKEN_TEST_CUDA=1 uv run pytest tests/test_cuda.py
 ```
 
 测试默认把 tilelang 缓存放到临时目录；如果本机无 GPU，CUDA kernel 不会被编译。
@@ -167,7 +177,8 @@ breezetoken/
 ## 已知限制
 
 - 只做单序列 decode；没有 batched prefill（长 prompt 逐 token 处理）。
-- RoPE、attention、GDN 递归仍在 torch；CUDA graph 尚未接入（动态 Python 控制流
+- CUDA 侧的 GEMV/RMSNorm/SiLU/fused-norm、RoPE 和 GDN decode 是 tilelang
+  kernel；attention 仍是 PyTorch SDPA，CUDA graph 尚未接入（动态 Python 控制流
   与当前 ops 契约需要先改成固定 buffer + device `Pos`）。
 - 文本模型；不支持 Qwen3.5 的 vision/audio 输入，也不支持 MTP/nextn 草稿层。
 - `max_context` 默认 8192（GGUF 声明 262144，运行时截断）；更大的上下文需要先
@@ -177,7 +188,7 @@ breezetoken/
 
 ### 路线
 
-1. 把 RoPE、attention、GDN 的 torch 算子收进 CPU/CUDA kernel；
+1. 把 attention 的 torch 算子收进 CPU/CUDA kernel（RoPE 已完成）；
 2. 采用固定 buffer + device `Pos` + 全容量掩码 attention，接 CUDA graph；
 3. batched prefill 与 KV/prefix 复用；
 4. 直接 Q8_0 GEMV 以降低权重带宽；
@@ -185,6 +196,6 @@ breezetoken/
 
 ## 许可
 
-仓库目前未声明项目级许可证。移植自 TileFoundry 的 CUDA GEMV 以及
-`examples/qwen3_0_6b/` 下的 TileOPs 代码遵循其 MIT 许可，见
+仓库目前未声明项目级许可证。移植自 TileFoundry 的 CUDA GEMV、TileOPs 的 GDN
+decode，以及 `examples/qwen3_0_6b/` 下的 TileOPs 代码遵循其 MIT 许可，见
 [NOTICE](NOTICE) 与 `LICENSES/`。

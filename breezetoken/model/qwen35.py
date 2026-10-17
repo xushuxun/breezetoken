@@ -172,6 +172,7 @@ class Qwen35:
             if i not in self._attn_set
         }
         self._cos, self._sin = self._rope_tables(self.cfg.max_context)
+        self._pos_buf = torch.zeros(1, dtype=torch.int32, device=self.device)
         self._sdpa_gqa = True
 
     # ------------------------------------------------------------------ load
@@ -203,22 +204,28 @@ class Qwen35:
         self.w["norm_f"] = self._norm("output_norm.weight")
         for i in range(self.cfg.n_layers):
             prefix = f"blk.{i}."
+            w_gate = self._weight(prefix + "ffn_gate.weight")
+            w_up = self._weight(prefix + "ffn_up.weight")
             layer = {
                 "norm_in": self._norm(prefix + "attn_norm.weight"),
                 "norm_post": self._norm(prefix + "post_attention_norm.weight"),
-                "w_gate": self._weight(prefix + "ffn_gate.weight"),
-                "w_up": self._weight(prefix + "ffn_up.weight"),
+                # One GEMV produces gate and up; the MLP splits the result.
+                "w_gu": torch.cat((w_gate, w_up), dim=1).contiguous(),
                 "w_down": self._weight(prefix + "ffn_down.weight"),
             }
+            del w_gate, w_up
             if i in self.cfg.attn_layers:
+                w_q = self._weight(prefix + "attn_q.weight")
+                w_k = self._weight(prefix + "attn_k.weight")
+                w_v = self._weight(prefix + "attn_v.weight")
                 layer.update(
-                    w_q=self._weight(prefix + "attn_q.weight"),
-                    w_k=self._weight(prefix + "attn_k.weight"),
-                    w_v=self._weight(prefix + "attn_v.weight"),
+                    # One GEMV for q (with its output gate), k and v.
+                    w_qkv_attn=torch.cat((w_q, w_k, w_v), dim=1).contiguous(),
                     w_o=self._weight(prefix + "attn_output.weight"),
                     q_norm=self._norm(prefix + "attn_q_norm.weight"),
                     k_norm=self._norm(prefix + "attn_k_norm.weight"),
                 )
+                del w_q, w_k, w_v
             else:
                 layer.update(
                     w_qkv=self._weight(prefix + "attn_qkv.weight"),
@@ -240,27 +247,28 @@ class Qwen35:
         if d.shape != (cfg.hidden, cfg.vocab):
             raise ValueError(f"token_embd shape {tuple(d.shape)} != {(cfg.hidden, cfg.vocab)}")
         for i, layer in enumerate(self.layers):
+            expect = {
+                "w_gu": (cfg.hidden, 2 * cfg.ffn),
+                "w_down": (cfg.ffn, cfg.hidden),
+            }
             if i in cfg.attn_layers:
-                expect = {
-                    "w_q": (cfg.hidden, cfg.n_heads * 2 * cfg.head_dim),
-                    "w_k": (cfg.hidden, cfg.n_kv * cfg.head_dim),
-                    "w_v": (cfg.hidden, cfg.n_kv * cfg.head_dim),
-                    "w_o": (cfg.n_heads * cfg.head_dim, cfg.hidden),
-                }
+                expect.update(
+                    w_qkv_attn=(
+                        cfg.hidden,
+                        cfg.n_heads * 2 * cfg.head_dim + 2 * cfg.n_kv * cfg.head_dim,
+                    ),
+                    w_o=(cfg.n_heads * cfg.head_dim, cfg.hidden),
+                )
             else:
-                expect = {
-                    "w_qkv": (cfg.hidden, 3 * cfg.ssm_inner),
-                    "w_z": (cfg.hidden, cfg.ssm_inner),
-                    "w_out": (cfg.ssm_inner, cfg.hidden),
-                }
+                expect.update(
+                    w_qkv=(cfg.hidden, 3 * cfg.ssm_inner),
+                    w_z=(cfg.hidden, cfg.ssm_inner),
+                    w_out=(cfg.ssm_inner, cfg.hidden),
+                )
             for name, shape in expect.items():
                 got = tuple(layer[name].shape)
                 if got != shape:
                     raise ValueError(f"blk.{i}.{name}: expected {shape}, got {got}")
-        for i in cfg.attn_layers:
-            layer = self.layers[i]
-            if layer["w_o"].shape[0] != cfg.n_heads * cfg.head_dim:
-                raise ValueError(f"blk.{i}.attn_output has a non-qwen35 layout")
 
     # ----------------------------------------------------------------- pieces
     def _embed(self, token: int) -> torch.Tensor:
@@ -280,18 +288,17 @@ class Qwen35:
         freqs = torch.cat((phases, phases), dim=-1)
         return freqs.cos(), freqs.sin()
 
-    def _rope(self, x: torch.Tensor, pos: int) -> torch.Tensor:
-        cfg = self.cfg
-        if not 0 <= pos < cfg.max_context:
-            raise ValueError(f"position {pos} outside [0, {cfg.max_context})")
-        rot = x[..., : cfg.rope_dim].float()
-        tail = x[..., cfg.rope_dim :].float()
-        half = cfg.rope_dim // 2
-        turned = (
-            rot * self._cos[pos]
-            + torch.cat((-rot[..., half:], rot[..., :half]), dim=-1) * self._sin[pos]
+    def _rope(self, x: torch.Tensor) -> torch.Tensor:
+        dim = x.shape[-1]
+        rows = x.numel() // dim
+        out = self.backend.rope(
+            x.reshape(rows, dim).contiguous(),
+            self._cos,
+            self._sin,
+            self._pos_buf,
+            self.cfg.rope_dim,
         )
-        return torch.cat((turned, tail), dim=-1).to(x.dtype)
+        return out.reshape(x.shape)
 
     def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Grouped-query decode attention; q (1,H,1,D), k/v (1,Hkv,S,D)."""
@@ -321,13 +328,16 @@ class Qwen35:
         layer = self.layers[i]
         head_slice = self._attn_index[i]
 
-        qg = self.backend.linear(xn, layer["w_q"]).view(1, cfg.n_heads, 2 * cfg.head_dim)
+        qkv = self.backend.linear(xn, layer["w_qkv_attn"])
+        q_size = cfg.n_heads * 2 * cfg.head_dim
+        kv_size = cfg.n_kv * cfg.head_dim
+        qg = qkv[:q_size].view(1, cfg.n_heads, 2 * cfg.head_dim)
         q, gate = qg[..., : cfg.head_dim], qg[..., cfg.head_dim :]
-        k = self.backend.linear(xn, layer["w_k"]).view(1, cfg.n_kv, cfg.head_dim)
-        v = self.backend.linear(xn, layer["w_v"]).view(1, cfg.n_kv, cfg.head_dim)
+        k = qkv[q_size : q_size + kv_size].view(1, cfg.n_kv, cfg.head_dim)
+        v = qkv[q_size + kv_size :].view(1, cfg.n_kv, cfg.head_dim)
 
-        q = self._rope(self.backend.rms_norm(q, layer["q_norm"], cfg.eps), pos)
-        k = self._rope(self.backend.rms_norm(k, layer["k_norm"], cfg.eps), pos)
+        q = self._rope(self.backend.rms_norm(q, layer["q_norm"], cfg.eps))
+        k = self._rope(self.backend.rms_norm(k, layer["k_norm"], cfg.eps))
 
         self.kv.k[head_slice, pos] = k.reshape(-1)
         self.kv.v[head_slice, pos] = v.reshape(-1)
@@ -352,19 +362,16 @@ class Qwen35:
         q = mixed[: cfg.ssm_inner].view(hv, dk)
         k = mixed[cfg.ssm_inner : 2 * cfg.ssm_inner].view(hv, dk)
         v = mixed[2 * cfg.ssm_inner :].view(hv, dv)
-        q = q * torch.rsqrt(q.pow(2).sum(dim=-1, keepdim=True) + cfg.l2_eps)
-        k = k * torch.rsqrt(k.pow(2).sum(dim=-1, keepdim=True) + cfg.l2_eps)
 
-        beta = torch.sigmoid(self.backend.linear(xn, layer["w_beta"])).view(hv)
+        beta_logits = self.backend.linear(xn, layer["w_beta"]).view(hv)
         # GGUF ssm_a is already -exp(A_log); do not exp() it again.
         g = layer["a_log"].float() * F.softplus(
             self.backend.linear(xn, layer["w_alpha"]) + layer["dt_bias"].float()
         ).view(hv)
-        decayed = state.rec * torch.exp(g).view(hv, 1, 1)
-        recalled = torch.einsum("hdv,hd->hv", decayed, k.float())
-        delta = (v.float() - recalled) * beta.view(hv, 1)
-        state.rec.copy_(decayed + k.float().unsqueeze(-1) * delta.unsqueeze(1))
-        read = torch.einsum("hdv,hd->hv", state.rec, q.float() * (dk**-0.5))
+        # The recurrent step owns q/k L2 norm, the beta sigmoid, the decayed
+        # state update and the read.  On CUDA that is one tilelang kernel; the
+        # torch backend implements the same contract as the reference.
+        read = self.backend.gdn_decode(q, k, v, g, beta_logits, state.rec, dk**-0.5, cfg.l2_eps)
 
         z = self.backend.linear(xn, layer["w_z"]).view(hv, dv)
         normed = self.backend.rms_norm(read, layer["ssm_norm"], cfg.eps)
@@ -373,9 +380,9 @@ class Qwen35:
 
     def _mlp(self, i: int, xn: torch.Tensor) -> torch.Tensor:
         layer = self.layers[i]
-        gate = self.backend.linear(xn, layer["w_gate"])
-        up = self.backend.linear(xn, layer["w_up"])
-        return self.backend.linear(self.backend.silu_mul(gate, up), layer["w_down"])
+        gu = self.backend.linear(xn, layer["w_gu"])
+        ffn = self.cfg.ffn
+        return self.backend.linear(self.backend.silu_mul(gu[:ffn], gu[ffn:]), layer["w_down"])
 
     # ------------------------------------------------------------------ step
     @torch.inference_mode()
@@ -388,20 +395,25 @@ class Qwen35:
         cfg = self.cfg
         if not 0 <= pos < cfg.max_context:
             raise ValueError(f"position {pos} outside [0, {cfg.max_context})")
+        self._pos_buf.fill_(pos)
         h = self._embed(token).view(1, -1)
+        # The residual add and the norm that follows it are one read, so every
+        # layer boundary uses fused_add_rms_norm.  The norm after the last MLP
+        # is norm_f and produces the head input directly.
+        xn = self.backend.rms_norm(h, self.layers[0]["norm_in"], cfg.eps)
         for i in range(cfg.n_layers):
             layer = self.layers[i]
-            xn = self.backend.rms_norm(h, layer["norm_in"], cfg.eps)
             if i in self._attn_set:
-                h = h + self._attn(i, xn, pos)
+                mixer = self._attn(i, xn, pos)
             else:
-                h = h + self._gdn(i, xn, self.states[i])
-            xn1 = self.backend.rms_norm(h, layer["norm_post"], cfg.eps)
-            h = h + self._mlp(i, xn1)
+                mixer = self._gdn(i, xn, self.states[i])
+            h, xn1 = self.backend.fused_add_rms_norm(h, mixer, layer["norm_post"], cfg.eps)
+            mlp = self._mlp(i, xn1)
+            next_norm = self.layers[i + 1]["norm_in"] if i + 1 < cfg.n_layers else self.w["norm_f"]
+            h, xn = self.backend.fused_add_rms_norm(h, mlp, next_norm, cfg.eps)
         if not logits:
             return None
-        hf = self.backend.rms_norm(h, self.w["norm_f"], cfg.eps)
-        return self.backend.linear(hf, self.w["head"]).float()
+        return self.backend.linear(xn, self.w["head"]).float()
 
     def reset(self) -> None:
         self.kv.reset()

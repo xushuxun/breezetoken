@@ -40,8 +40,47 @@ class Backend(ABC):
         """RMSNorm over the last dimension, with a flat learned weight."""
 
     @abstractmethod
+    def rope(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        pos: torch.Tensor,
+        rope_dim: int,
+    ) -> torch.Tensor:
+        """Partial rotate-half RoPE on the leading ``rope_dim`` dimensions."""
+
+    @abstractmethod
+    def fused_add_rms_norm(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``h = a + b`` and ``xn = rms_norm(h, w, eps)``, sharing one read."""
+
+    @abstractmethod
     def silu_mul(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         """``silu(gate) * up``."""
+
+    @abstractmethod
+    def gdn_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        scale: float,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """One gated-delta-rule step; updates ``state`` in place and returns ``o``.
+
+        ``q``/``k``/``v`` are ``(H, D)``; ``g`` (log decay) and ``beta`` (raw
+        logits) are ``(H,)``; ``state`` is the f32 ``(H, D, D)`` recurrent state.
+        """
 
     def close(self) -> None:
         """Release cached kernels; backends must remain usable until called."""
@@ -67,10 +106,29 @@ class TorchBackend(Backend):
         xf = x.float()
         return xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()
 
+    def rope(self, x, cos, sin, pos, rope_dim):
+        return _torch_rope(x, cos, sin, pos, rope_dim)
+
+    def fused_add_rms_norm(self, a, b, w, eps):
+        return _torch_fused_add_rms_norm(a, b, w, eps)
+
     def silu_mul(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         if gate.shape != up.shape:
             raise ValueError(f"silu_mul shape mismatch: {tuple(gate.shape)} vs {tuple(up.shape)}")
         return torch.nn.functional.silu(gate.float()) * up.float()
+
+    def gdn_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        scale: float,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        return _torch_gdn_decode(q, k, v, g, beta, state, scale, eps)
 
     def __repr__(self) -> str:
         return f"TorchBackend(device={self.device!r}, dtype={self.weight_dtype})"
@@ -88,6 +146,66 @@ def _torch_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tenso
 
 def _torch_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.silu(gate.float()) * up.float()
+
+
+def _torch_rope(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch.Tensor, rope_dim: int
+) -> torch.Tensor:
+    p = int(pos.reshape(-1)[0].item())
+    rot = x[..., :rope_dim].float()
+    tail = x[..., rope_dim:].float()
+    half = rope_dim // 2
+    turned = rot * cos[p] + torch.cat((-rot[..., half:], rot[..., :half]), dim=-1) * sin[p]
+    return torch.cat((turned, tail), dim=-1).to(x.dtype)
+
+
+def _torch_fused_add_rms_norm(
+    a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if a.shape != b.shape:
+        if b.numel() == a.numel():
+            b = b.reshape(a.shape)
+        else:
+            raise ValueError(f"fused_add_rms_norm shape mismatch: {a.shape} vs {b.shape}")
+    h = a + b
+    return h, _torch_rms_norm(h, w, eps)
+
+
+@torch.no_grad()
+def _torch_gdn_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    scale: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Reference gated-delta-rule step (state is f32 and updated in place)."""
+    if q.shape != k.shape or q.shape != v.shape or q.ndim != 2:
+        raise ValueError("q/k/v must all be (heads, dim)")
+    heads, dim = q.shape
+    if state.shape != (heads, dim, dim):
+        raise ValueError(f"state shape {tuple(state.shape)} != {(heads, dim, dim)}")
+    qf = q.float()
+    kf = k.float()
+    vf = v.float()
+    qn = qf * torch.rsqrt(qf.pow(2).sum(dim=-1, keepdim=True) + eps) * scale
+    kn = kf * torch.rsqrt(kf.pow(2).sum(dim=-1, keepdim=True) + eps)
+    decayed = state * torch.exp(g.float()).view(heads, 1, 1)
+    recalled = torch.einsum("hdv,hd->hv", decayed, kn)
+    delta = (vf - recalled) * torch.sigmoid(beta.float()).unsqueeze(-1)
+    state.copy_(decayed + kn.unsqueeze(-1) * delta.unsqueeze(-2))
+    return torch.einsum("hdv,hd->hv", state, qn)
+
+
+def _gdn_launch(heads: int, dim: int, device: str) -> tuple[int, int]:
+    """Block shape for the decode kernel (TileOPs' launch heuristic)."""
+    sm_count = torch.cuda.get_device_properties(torch.device(device)).multi_processor_count
+    if heads * (dim // 32) >= 6 * sm_count:
+        return 32, 1
+    return 64, 2
 
 
 class _KernelCache:
@@ -182,11 +300,11 @@ class _CudaRmsNorm:
 
         threads = 256 if N >= 256 else (128 if N >= 128 else 32)
         kernel = rms_norm(rows, N, eps, threads)
-        out = torch.empty((rows, N), dtype=torch.float32, device=device)
 
         def run(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((rows, N), dtype=torch.float32, device=device)
             kernel(x, w, out)
-            return out.clone()
+            return out
 
         return run
 
@@ -204,11 +322,85 @@ class _CpuRmsNorm:
         from breezetoken.kernels.cpu.norm import rms_norm
 
         kernel = rms_norm(rows, N, eps)
-        out = torch.empty((rows, N), dtype=torch.float32, device=device)
 
         def run(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((rows, N), dtype=torch.float32, device=device)
             kernel(x, w, out)
-            return out.clone()
+            return out
+
+        return run
+
+
+class _CudaRope:
+    device = "cuda"
+    dtype = torch.float32
+
+    @classmethod
+    def supports(cls, rows: int, dim: int, rope_dim: int, dtype: torch.dtype) -> bool:
+        return dtype == cls.dtype and rows > 0 and 0 < rope_dim <= dim and rope_dim % 2 == 0
+
+    @classmethod
+    def build(cls, rows: int, dim: int, rope_dim: int, cap: int, device: str):
+        from breezetoken.kernels.cuda.rope import rope
+
+        kernel = rope(rows, dim, rope_dim, cap)
+
+        def run(
+            x: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            pos: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty((rows, dim), dtype=torch.float32, device=device)
+            kernel(x.reshape(rows, dim), cos, sin, pos.reshape(1).to(torch.int32), out)
+            return out
+
+        return run
+
+
+class _CudaResidRmsNorm:
+    device = "cuda"
+    dtype = torch.float32
+
+    @classmethod
+    def supports(cls, rows: int, N: int, dtype: torch.dtype) -> bool:
+        return dtype == cls.dtype and 0 < N <= 8192 and rows > 0
+
+    @classmethod
+    def build(cls, rows: int, N: int, eps: float, device: str):
+        from breezetoken.kernels.cuda.norm import resid_rms_norm
+
+        threads = 256 if N >= 256 else (128 if N >= 128 else 32)
+        kernel = resid_rms_norm(rows, N, eps, threads)
+
+        def run(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor):
+            hout = torch.empty((rows, N), dtype=torch.float32, device=device)
+            xn = torch.empty((rows, N), dtype=torch.float32, device=device)
+            kernel(a, b, w, hout, xn)
+            return hout, xn
+
+        return run
+
+
+class _CpuResidRmsNorm:
+    device = "cpu"
+    dtype = torch.float32
+
+    @classmethod
+    def supports(cls, rows: int, N: int, dtype: torch.dtype) -> bool:
+        return dtype == cls.dtype and N > 0 and rows > 0
+
+    @classmethod
+    def build(cls, rows: int, N: int, eps: float, device: str):
+        from breezetoken.kernels.cpu.norm import resid_rms_norm
+
+        kernel = resid_rms_norm(rows, N, eps)
+
+        def run(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor):
+            hout = torch.empty((rows, N), dtype=torch.float32, device=device)
+            xn = torch.empty((rows, N), dtype=torch.float32, device=device)
+            kernel(a, b, w, hout, xn)
+            return hout, xn
 
         return run
 
@@ -226,11 +418,11 @@ class _CudaSiluMul:
         from breezetoken.kernels.cuda.norm import silu_mul
 
         kernel = silu_mul(size)
-        out = torch.empty(size, dtype=torch.float32, device=device)
 
         def run(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(size, dtype=torch.float32, device=device)
             kernel(gate.reshape(-1), up.reshape(-1), out)
-            return out.clone()
+            return out
 
         return run
 
@@ -248,13 +440,39 @@ class _CpuSiluMul:
         from breezetoken.kernels.cpu.norm import silu_mul
 
         kernel = silu_mul(size)
-        out = torch.empty(size, dtype=torch.float32, device=device)
 
         def run(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(size, dtype=torch.float32, device=device)
             kernel(gate.reshape(-1), up.reshape(-1), out)
-            return out.clone()
+            return out
 
         return run
+
+
+def _build_gdn_decode(heads: int, dim: int, scale: float, threads: int, lane_group: int):
+    from breezetoken.kernels.cuda.gdn import gdn_decode
+
+    kernel = gdn_decode(heads, dim, scale, threads, lane_group)
+
+    def run(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        out = kernel(
+            q.contiguous().view(1, 1, heads, dim),
+            k.contiguous().view(1, 1, heads, dim),
+            v.contiguous().view(1, 1, heads, dim),
+            g.contiguous().view(1, 1, heads),
+            beta.contiguous().view(1, 1, heads),
+            state.view(1, heads, dim, dim),
+        )
+        return out.view(heads, dim)
+
+    return run
 
 
 class TilelangBackend(Backend):
@@ -269,6 +487,8 @@ class TilelangBackend(Backend):
         self._cache = _KernelCache()
         self._gemv = [_CudaGemv] if family == "cuda" else [_CpuGemv]
         self._rms = [_CudaRmsNorm] if family == "cuda" else [_CpuRmsNorm]
+        self._rope = [_CudaRope] if family == "cuda" else []
+        self._resid = [_CudaResidRmsNorm] if family == "cuda" else [_CpuResidRmsNorm]
         self._silu = [_CudaSiluMul] if family == "cuda" else [_CpuSiluMul]
 
     def linear(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -300,6 +520,49 @@ class TilelangBackend(Backend):
             return out.reshape(x.shape)
         return _torch_rms_norm(x, w, eps)
 
+    def rope(self, x, cos, sin, pos, rope_dim):
+        dim = x.shape[-1]
+        rows = x.numel() // dim
+        for spec in self._rope:
+            if not spec.supports(rows, dim, rope_dim, x.dtype):
+                continue
+            cap = cos.shape[0]
+            key = ("rope", spec.__name__, rows, dim, rope_dim, cap, self.device)
+            fn = self._cache.get(
+                key,
+                lambda spec=spec, rows=rows, dim=dim, rope_dim=rope_dim, cap=cap: spec.build(
+                    rows, dim, rope_dim, cap, self.device
+                ),
+            )
+            return fn(x.reshape(rows, dim).contiguous(), cos, sin, pos).reshape(x.shape)
+        return _torch_rope(x, cos, sin, pos, rope_dim)
+
+    def fused_add_rms_norm(self, a, b, w, eps):
+        if a.shape != b.shape:
+            if b.numel() == a.numel():
+                b = b.reshape(a.shape)
+            else:
+                raise ValueError(f"fused_add_rms_norm shape mismatch: {a.shape} vs {b.shape}")
+        N = a.shape[-1]
+        if w.numel() != N:
+            raise ValueError(f"fused_add_rms_norm weight shape {tuple(w.shape)} != {N}")
+        rows = a.numel() // N
+        for spec in self._resid:
+            if not spec.supports(rows, N, a.dtype):
+                continue
+            key = ("resid_rms_norm", spec.__name__, rows, N, eps, self.device)
+            fn = self._cache.get(
+                key,
+                lambda spec=spec, rows=rows, N=N, eps=eps: spec.build(rows, N, eps, self.device),
+            )
+            hout, xn = fn(
+                a.reshape(rows, N).contiguous(),
+                b.reshape(rows, N).contiguous(),
+                w.reshape(-1),
+            )
+            return hout.reshape(a.shape), xn.reshape(a.shape)
+        return _torch_fused_add_rms_norm(a, b, w, eps)
+
     def silu_mul(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         if gate.shape != up.shape:
             raise ValueError(f"silu_mul shape mismatch: {tuple(gate.shape)} vs {tuple(up.shape)}")
@@ -311,6 +574,41 @@ class TilelangBackend(Backend):
             fn = self._cache.get(key, lambda spec=spec, size=size: spec.build(size, self.device))
             return fn(gate, up)
         return _torch_silu_mul(gate, up)
+
+    def gdn_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        scale: float,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        heads, dim = q.shape
+        servable = (
+            self._family == "cuda"
+            and q.dtype == torch.float32
+            and k.dtype == torch.float32
+            and v.dtype == torch.float32
+            and state.dtype == torch.float32
+            and state.shape == (heads, dim, dim)
+            and dim in (64, 128)
+            and eps == 1e-6
+            and state.is_contiguous()
+        )
+        if servable:
+            threads, lane_group = _gdn_launch(heads, dim, self.device)
+            key = ("gdn", heads, dim, scale, threads, lane_group, self.device)
+            fn = self._cache.get(
+                key,
+                lambda heads=heads, dim=dim, scale=scale, threads=threads, lane=lane_group: (
+                    _build_gdn_decode(heads, dim, scale, threads, lane)
+                ),
+            )
+            return fn(q, k, v, g, beta, state)
+        return _torch_gdn_decode(q, k, v, g, beta, state, scale, eps)
 
     def close(self) -> None:
         self._cache.clear()

@@ -19,3 +19,7 @@ wheels/
 
 # Local models / artifacts
 *.gguf
+
+# External upstream checkouts used only for reference/license comparison
+/TileFoundry/
+/TileOPs/

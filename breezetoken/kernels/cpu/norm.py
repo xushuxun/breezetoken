@@ -1,7 +1,5 @@
 """CPU RMSNorm and SwiGLU helpers (f32, one row per block)."""
 
-from __future__ import annotations
-
 from functools import cache
 
 import tilelang
@@ -45,5 +43,30 @@ def silu_mul(I: int, block: int = 256):
                     # into inf * 0 = NaN. silu(g) is ~0 below -80 anyway.
                     g = T.max(G[idx], -80.0)
                     O[idx] = (g / (1.0 + _exp(-g))) * U[idx]
+
+    return tilelang.compile(main, target=TARGET, compile_flags=CC_FLAGS)
+
+
+@cache
+def resid_rms_norm(M: int, N: int, eps: float):
+    """``Hout = A + B`` followed by RMSNorm(Hout); one kernel and one read."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), DT),
+        B: T.Tensor((M, N), DT),
+        G: T.Tensor((N,), DT),
+        Hout: T.Tensor((M, N), DT),
+        Xn: T.Tensor((M, N), DT),
+    ):
+        with T.Kernel(M, threads=1) as row:
+            total = T.alloc_fragment((1,), DT)
+            total[0] = 0.0
+            for i in T.serial(N):
+                v = A[row, i] + B[row, i]
+                Hout[row, i] = v
+                total[0] += v * v
+            for i in T.Parallel(N):
+                Xn[row, i] = Hout[row, i] * T.rsqrt(total[0] / N + eps) * G[i]
 
     return tilelang.compile(main, target=TARGET, compile_flags=CC_FLAGS)

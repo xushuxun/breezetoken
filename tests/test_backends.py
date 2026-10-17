@@ -23,6 +23,13 @@ def test_torch_backend_matches_manual_math() -> None:
     up = torch.randn(6)
     assert torch.allclose(backend.silu_mul(gate, up), torch.nn.functional.silu(gate) * up)
 
+    other = torch.randn_like(x3)
+    hout, xn = backend.fused_add_rms_norm(x3, other, gamma, 1e-6)
+    ref_h = x3 + other
+    ref_xn = ref_h * torch.rsqrt(ref_h.pow(2).mean(-1, keepdim=True) + 1e-6) * gamma
+    assert torch.allclose(hout, ref_h, atol=1e-6)
+    assert torch.allclose(xn, ref_xn, atol=1e-6)
+
 
 def test_make_backend_rejects_unknown() -> None:
     with pytest.raises(ValueError):
@@ -53,6 +60,13 @@ def test_tilelang_cpu_kernels_match_torch() -> None:
     assert torch.allclose(
         backend.silu_mul(gate, up), torch.nn.functional.silu(gate) * up, atol=1e-5
     )
+
+    other = torch.randn_like(x3)
+    hout, xn = backend.fused_add_rms_norm(x3, other, gamma, 1e-6)
+    ref_h = x3 + other
+    ref_xn = ref_h * torch.rsqrt(ref_h.pow(2).mean(-1, keepdim=True) + 1e-6) * gamma
+    assert torch.allclose(hout, ref_h, atol=1e-5)
+    assert torch.allclose(xn, ref_xn, atol=1e-5)
     backend.close()
 
 

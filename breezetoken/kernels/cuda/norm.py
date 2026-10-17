@@ -5,8 +5,6 @@ these kernels use f32 throughout.  That keeps the arithmetic identical to the
 torch reference and avoids mixed-dtype buffer plumbing.
 """
 
-from __future__ import annotations
-
 from functools import cache
 
 import tilelang
@@ -47,5 +45,32 @@ def silu_mul(I: int, block: int = 256, threads: int = 256):
                 with T.If(idx < I), T.Then():
                     g = T.max(G[idx], -80.0)
                     O[idx] = (g / (1.0 + T.exp(-g))) * U[idx]
+
+    return tilelang.compile(main)
+
+
+@cache
+def resid_rms_norm(M: int, N: int, eps: float, threads: int = 256):
+    """``Hout = A + B`` followed by RMSNorm(Hout); one kernel and one read."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), DT),
+        B: T.Tensor((M, N), DT),
+        G: T.Tensor((N,), DT),
+        Hout: T.Tensor((M, N), DT),
+        Xn: T.Tensor((M, N), DT),
+    ):
+        with T.Kernel(M, threads=threads) as row:
+            xs = T.alloc_fragment((N,), DT)
+            sq = T.alloc_fragment((N,), DT)
+            total = T.alloc_fragment((1,), DT)
+            for i in T.Parallel(N):
+                xs[i] = A[row, i] + B[row, i]
+                Hout[row, i] = xs[i]
+                sq[i] = xs[i] * xs[i]
+            T.reduce_sum(sq, total, dim=0)
+            for i in T.Parallel(N):
+                Xn[row, i] = xs[i] * T.rsqrt(total[0] / N + eps) * G[i]
 
     return tilelang.compile(main)

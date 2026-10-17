@@ -6,8 +6,6 @@ GPU's shared-memory opt-in ceiling; the backend checks them before selecting
 this kernel.
 """
 
-from __future__ import annotations
-
 from functools import cache
 
 import tilelang

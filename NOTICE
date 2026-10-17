@@ -9,8 +9,9 @@ This product includes software developed by third parties:
    See LICENSES/TileFoundry-MIT.txt.
 
 2. TileOPs (https://github.com/tile-ai/TileOPs), MIT License.
-   The legacy examples/qwen3_0_6b/tileops_lite/ tree contains adapted
-   TileOPs components.
+   breezetoken/kernels/cuda/gdn.py is adapted from TileOPs' delta-rule
+   decode kernel, and the legacy examples/qwen3_0_6b/tileops_lite/ tree
+   contains adapted TileOPs components.
    See LICENSES/TileOPs-MIT.txt.
 
 3. Qwen3.5 model weights and tokenizer assets are distributed by their
