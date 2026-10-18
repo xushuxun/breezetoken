@@ -1,10 +1,17 @@
-"""Metadata/scaffold checks for the planned native 35B path."""
+"""Scaffold/metadata checks for the native 35B path (phases 1-2 done)."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
 from breezetoken.quant.formats import FORMATS, GGMLType, format_for_type
+
+GGUF_PATH = (
+    "/home/xun/.cache/modelscope/models/unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/master/"
+    "Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
+)
 
 
 def test_quant_format_table_matches_ggml_blocks() -> None:
@@ -18,26 +25,39 @@ def test_quant_format_table_matches_ggml_blocks() -> None:
     assert format_for_type(int(GGMLType.IQ3_S)).name == "iq3_s"
 
 
-def test_quant_scaffold_is_explicitly_unimplemented() -> None:
-    from breezetoken.kernels.cpu.quant_gemv import quant_gemv as cpu_gemv
-    from breezetoken.quant.dequant import dequantize_row
+def test_quant_tables_ported_from_ggml() -> None:
+    from breezetoken.quant._tables import IQ2S_GRID, IQ3S_GRID, IQ4NL_VALUES
 
-    with pytest.raises(NotImplementedError, match="phase"):
-        dequantize_row(memoryview(b""), format_for_type(21), 256)
-    with pytest.raises(NotImplementedError, match="phase"):
-        cpu_gemv(None, memoryview(b""), None, format_for_type(21))
+    assert IQ2S_GRID.shape == (1024, 8)
+    assert IQ3S_GRID.shape == (512, 4)
+    assert IQ4NL_VALUES.tolist() == [
+        -127,
+        -104,
+        -83,
+        -65,
+        -49,
+        -35,
+        -22,
+        -10,
+        1,
+        13,
+        25,
+        38,
+        53,
+        69,
+        89,
+        113,
+    ]
+    # first rows decode from the little-endian C hex literals
+    assert IQ2S_GRID[1].tolist() == [43, 8, 8, 8, 8, 8, 8, 8]
+    assert IQ3S_GRID[1].tolist() == [3, 1, 1, 1]
 
 
 def test_qwen36_config_matches_checkpoint_metadata() -> None:
-    from pathlib import Path
-
     from breezetoken.gguf import GGUFFile
     from breezetoken.model.qwen36_moe import Qwen36Config
 
-    path = Path(
-        "/home/xun/.cache/modelscope/models/unsloth--Qwen3.6-35B-A3B-MTP-GGUF/"
-        "snapshots/master/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
-    )
+    path = Path(GGUF_PATH)
     if not path.is_file():
         pytest.skip("Qwen3.6-35B-A3B IQ3_S checkpoint is not available")
     with GGUFFile(path) as gguf:
@@ -47,18 +67,5 @@ def test_qwen36_config_matches_checkpoint_metadata() -> None:
     assert cfg.n_heads == 16 and cfg.n_kv == 2
     assert cfg.n_experts == 256 and cfg.top_k == 8
     assert cfg.gdn_key_heads == 16 and cfg.gdn_value_heads == 32
-
-
-def test_engine_rejects_native_moe_without_llama_fallback() -> None:
-    from pathlib import Path
-
-    from breezetoken.engine import Engine
-
-    path = Path(
-        "/home/xun/.cache/modelscope/models/unsloth--Qwen3.6-35B-A3B-MTP-GGUF/"
-        "snapshots/master/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
-    )
-    if not path.is_file():
-        pytest.skip("Qwen3.6-35B-A3B IQ3_S checkpoint is not available")
-    with pytest.raises(NotImplementedError, match="qwen36_35b_plan"):
-        Engine.load(path, max_context=128)
+    assert cfg.expert_ffn == 512 and cfg.shared_ffn == 512
+    assert len(cfg.attn_layers) == 10 and cfg.attn_layers[-1] == 39

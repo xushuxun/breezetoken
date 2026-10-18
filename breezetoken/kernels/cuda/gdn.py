@@ -13,8 +13,9 @@ decay are fused here, so the model only computes the projections around it.
 
 Qwen3.5-0.8B has one key head per value head.  The kernel also accepts
 ``value_heads > key_heads`` (e.g. 35B-A3B's 32 value / 16 key heads): value
-head ``h`` reads key/query head ``h // (value_heads // key_heads)``, matching
-the GQA-style grouping used by the reference kernels.
+head ``h`` reads key/query head ``h % key_heads``, matching the tiling used by
+ggml's fused ``gated_delta_net`` (and the torch reference in
+``breezetoken.backends``).
 """
 
 from functools import cache
@@ -50,7 +51,6 @@ def gdn_decode(
         raise ValueError(f"dim must be divisible by the {value_tile} columns per block")
     value_tiles = dim // value_tile
     total_blocks = heads_v * value_tiles
-    group = heads_v // heads_k
     k_chunk = dim // lane_group
     lane_group_stages = lane_group.bit_length() - 1
     l2_eps = 1e-6
@@ -71,7 +71,7 @@ def gdn_decode(
                 tx = T.get_thread_binding()
                 value_tile_idx = block % value_tiles
                 head_idx = block // value_tiles
-                key_head = head_idx // group
+                key_head = head_idx % heads_k
                 value_lane = tx // lane_group
                 k_rank = tx - value_lane * lane_group
                 value_idx = value_tile_idx * value_tile + value_lane

@@ -11,8 +11,10 @@ GPU 前缀与 CPU 后缀组合起来。0.8B 在 8GB 卡上直接全 GPU；更大
 ## 特性
 
 - **模型**：Qwen3.5-0.8B（24 层 = 18 GDN + 6 GQA）原生 kernel。Qwen3.6-35B-A3B
-  （40 层 = 30 GDN + 10 GQA，256 experts/top-8，IQ3_S）已创建原生 plan 和
-  quant/MoE scaffold，尚未实现。
+  （40 层 = 30 GDN + 10 GQA，256 experts/top-8，IQ3_S）已实现原生混合执行：
+  非专家权重 dequant 成 bf16 上 GPU，专家张量保持 mmap 量化字节、按 token
+  把 top-8 专家 stage 到计算设备 dequant + matmul（greedy 与 llama.cpp
+  逐 token 一致，decode 约 2 tok/s；细节见 [docs/qwen36_35b_plan.md](docs/qwen36_35b_plan.md)）。
 - **权重**：GGUF v3 mmap 读取，Q8_0/f32，分块反量化以限制峰值内存；embedding 与
   lm_head 共用一份 `(H, V)` 权重。
 - **tokenizer**：HuggingFace Rust `tokenizers` 从 GGUF 元数据重建；NFC、与
@@ -66,10 +68,10 @@ uv run breezetoken --prompt "用一句话解释 RoPE" --max-new-tokens 64
 # 原始 completion（不加 chat template）
 uv run breezetoken --prompt "The capital of France is" --raw --max-new-tokens 4
 
-# 35B-A3B IQ3_S 当前会明确提示尚未实现；plan 见 docs/qwen36_35b_plan.md
+# 35B-A3B IQ3_S 原生混合执行（非专家 bf16 上 GPU，专家量化字节 mmap 按 token stage）
 uv run breezetoken \
   --model ~/.cache/modelscope/models/unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/master/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
-  --prompt "你好" --max-new-tokens 1
+  --prompt "你好" --max-new-tokens 32
 
 # 只看自动放置结果（正常使用不需要传 backend/device）
 uv run breezetoken --prompt "你好"
@@ -170,8 +172,8 @@ BREEZETOKEN_TEST_TILELANG=1 uv run pytest tests/test_model.py
 # CUDA kernel 每次有 GPU 都会跑；完整 CUDA 模型需要显式开启
 BREEZETOKEN_TEST_CUDA=1 uv run pytest tests/test_cuda.py
 
-# 35B IQ3_S 原生路径的格式/scaffold 检查（当前只验证未实现边界）
-uv run pytest tests/test_quant_scaffold.py
+# 35B IQ3_S 原生路径：dequant 单测、quant GEMV、MoE router、模型级 greedy 对拍
+uv run pytest tests/test_quant_dequant.py tests/test_quant_gemv.py tests/test_moe.py tests/test_qwen36_moe.py
 ```
 
 测试默认把 tilelang 缓存放到临时目录；如果本机无 GPU，CUDA kernel 不会被编译。
@@ -185,15 +187,15 @@ breezetoken/
 ├── tokenizer.py       # tokenizers BPE + NFC + special tokens + chat template
 ├── planner.py         # 硬件/模型画像 + GPU 前缀/CPU 后缀放置
 ├── backends.py        # Backend 协议 + TorchBackend + TilelangBackend + 工厂
-├── quant/             # IQ/K-quant 格式、descriptor、参考 dequant 接口
+├── quant/             # IQ/K-quant 格式表、IQ 网格表、QuantizedTensor、向量化 dequant
 ├── model/
 │   ├── config.py      # Qwen35Config + KV/GDN state
 │   ├── layers.py      # attention / GDN / dense MLP
 │   ├── prefill.py     # batched prefill
 │   ├── graph.py       # CUDA graph
 │   ├── qwen35.py      # native facade/loading/generation
-│   ├── moe.py         # 35B MoE contracts (scaffold)
-│   └── qwen36_moe.py  # 35B config/loader (scaffold)
+│   ├── moe.py         # 35B softmax router + ExpertPool 量化专家 stage/执行
+│   └── qwen36_moe.py  # 35B 混合放置 decoder（GDN 16K/32V、attn 16Q/2KV + gate）
 ├── engine.py          # model + tokenizer + EOS/上下文/生成策略
 ├── streaming.py       # GenerationJob、StopBuffer、增量 UTF-8
 ├── kernels/

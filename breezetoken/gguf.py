@@ -128,6 +128,20 @@ class GGUFFile:
             raise KeyError(f"tensor {name!r} not found in {self.path.name}") from exc
         return shape, _TYPE_NAMES.get(ttype, f"type_{ttype}")
 
+    def tensor_layout(self, name: str) -> tuple[tuple[int, ...], int, int]:
+        """(logical shape, GGML type id, absolute byte offset) for quant paths."""
+        try:
+            return self._tensors[name]
+        except KeyError as exc:
+            raise KeyError(f"tensor {name!r} not found in {self.path.name}") from exc
+
+    def bytes_view(self, offset: int, size: int) -> np.memmap:
+        """Zero-copy uint8 view of ``size`` bytes at ``offset`` in the mapping."""
+        buf = self._require_buf()
+        if offset < 0 or offset + size > buf.nbytes:
+            raise ValueError(f"byte range [{offset}, {offset + size}) outside {self.path.name}")
+        return buf[offset : offset + size]
+
     @property
     def arch(self) -> str:
         return str(self.metadata["general.architecture"])

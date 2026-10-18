@@ -263,7 +263,7 @@ def _torch_gdn_decode(
     vf = v.float()
     qn = qf * torch.rsqrt(qf.pow(2).sum(dim=-1, keepdim=True) + eps) * scale
     kn = kf * torch.rsqrt(kf.pow(2).sum(dim=-1, keepdim=True) + eps)
-    index = torch.arange(heads_v, device=q.device) // (heads_v // heads_k)
+    index = torch.arange(heads_v, device=q.device) % heads_k
     decayed = state * torch.exp(g.float()).view(heads_v, 1, 1)
     recalled = torch.einsum("hdv,hd->hv", decayed, kn[index])
     delta = (vf - recalled) * torch.sigmoid(beta.float()).unsqueeze(-1)

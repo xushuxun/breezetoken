@@ -15,12 +15,13 @@ from typing import Any
 
 from breezetoken.gguf import GGUFFile
 from breezetoken.model.qwen35 import Qwen35
+from breezetoken.model.qwen36_moe import Qwen36Moe
 from breezetoken.tokenizer import BPETokenizer
 
 
 @dataclass
 class Engine:
-    model: Qwen35
+    model: Qwen35 | Qwen36Moe
     tokenizer: BPETokenizer
     model_id: str
 
@@ -39,13 +40,25 @@ class Engine:
             raise FileNotFoundError(f"GGUF model not found: {path}")
         with GGUFFile(path) as gguf:
             arch = gguf.arch
+            if arch == "qwen35moe":
+                # The native hybrid decoder owns its GGUF mapping (expert
+                # tensors stay mmap'd), so it is constructed from the path.
+                tokenizer = BPETokenizer(gguf)
+                model_id = str(gguf.metadata.get("general.name") or path.stem)
+                model = Qwen36Moe(
+                    path,
+                    device=device,
+                    dtype=dtype,
+                    max_context=max_context,
+                    backend=backend,
+                )
+                return cls(model=model, tokenizer=tokenizer, model_id=model_id)
             native_quant = all(
                 gguf.tensor_info(name)[1] in ("f32", "q8_0") for name in gguf.tensor_names()
             )
             if arch != "qwen35" or not native_quant:
                 raise NotImplementedError(
-                    f"{arch} / non-Q8 GGUF is not supported by the native engine yet; "
-                    "see docs/qwen36_35b_plan.md for the native IQ3_S/MoE plan"
+                    f"{arch} / non-Q8 GGUF is not supported by the native engine yet"
                 )
             tokenizer = BPETokenizer(gguf)
             model = Qwen35(

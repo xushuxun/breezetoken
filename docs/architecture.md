@@ -1,8 +1,8 @@
 # breezetoken 架构
 
 > 定位：单机、单序列、以 tilelang kernel 为核心的本地推理引擎。
-> 当前版本：0.2.x。原生路径支持 Qwen3.5-0.8B（Q8_0/f32）；Qwen3.6-35B-A3B
-> （IQ3_S、256 experts）只有原生 plan/scaffold，尚未实现。
+> 当前版本：0.2.x。原生路径支持 Qwen3.5-0.8B（Q8_0/f32）与
+> Qwen3.6-35B-A3B（IQ3_S、256 experts，混合量化执行，见 §3.5）。
 
 ## 1. 分层
 
@@ -26,9 +26,8 @@ CLI / HTTP  ───► │ engine.py                    │  prompt / chat / E
 attention/GDN/MLP，`prefill` 只做批量 prompt，`graph` 只做 CUDA graph，
 `qwen35.py`（436 行）只保留加载、forward 和 generation。
 
-`qwen35moe`（35B-A3B）暂不进入原生执行：`Engine.load` 会抛
-`NotImplementedError`，指向 [qwen36_35b_plan.md](qwen36_35b_plan.md)。量化格式、
-tensor descriptor、quant GEMV 和 MoE 目前只有 scaffold；不会调用 llama.cpp。
+`qwen35moe`（35B-A3B）走 §3.5 的原生混合执行：`Engine.load` 按 arch 路由到
+`Qwen36Moe`，量化专家留在 mmap 里按 token stage，不调用 llama.cpp。
 `model` 不知道 tilelang，`kernels` 不知道模型；`torch` 后端不 import tilelang，因此
 可以在 tilelang 不可用时仍作为参考实现。
 
@@ -145,20 +144,31 @@ eager 约 54 tok/s decode（TTFT 约 87ms）；warmup 捕获并复用 CUDA graph
 图路径的 token 读取需要在 host 侧 `.item()` 同步；这也是当前 126 tok/s 与
 旧 188 tok/s 的主要差距（旧实现把更多采样/控制流也放进了图）。
 
-## 3.5 35B-A3B 原生计划
+## 3.5 35B-A3B 原生混合执行（已实现）
 
-Qwen3.6-35B-A3B 是 `qwen35moe`、IQ3_S、15GB、40 层、256 experts/top-8。原生
-执行不能把权重 materialize 成 f32/bf16；需要：
+Qwen3.6-35B-A3B 是 `qwen35moe`、IQ3_S、15GB、40 层、256 experts/top-8。当前
+实现（详见 [qwen36_35b_plan.md](qwen36_35b_plan.md)，阶段 1-5 已完成）：
 
-- `quant/` 的 GGML 格式表、QuantizedTensor 行描述和参考 dequant；
-- CPU/CUDA `quant_gemv`，把 dequant 融进 GEMV；
-- GDN 16K/32V、attention 16Q/2KV + output gate；
-- router/top-8/shared expert、CPU 专家 + GPU 非专家的分量级放置；
-- 先做 dequant 单测，再做单层 MoE，再做全模型。
+- `quant/`：GGML 格式表、`QuantizedTensor` 行描述、9 种格式的向量化 dequant
+  （torch 实现，CPU/CUDA 同构；`scripts/gen_qtables.py` 从 ggml-common.h 生成
+  IQ 网格表，逐位对齐验证）；
+- **分量级混合放置**：非专家权重（attention/GDN/shared/head/embd）加载时 dequant
+  成 bf16 上 GPU（约 4.7 GiB）；专家张量保持 mmap 量化的字节留在 CPU，decode 时
+  按 top-8 把原始量化字节经 pinned buffer 一次性 stage 到 GPU，在同一设备上
+  dequant + matmul（`model/moe.py::ExpertPool`，gate/up 融合成一次 GEMV）；
+- GDN 16K/32V（注意：value head v 取 key head `v % 16`，与 ggml fused kernel
+  一致，不是 GQA 的 `//` 分组）、attention 16Q/2KV + output gate、partial
+  RoPE(64, θ=1e7)、router softmax/top-8/重归一化、scalar sigmoid 门控 shared expert；
+- `Engine.load` 按 arch 路由：`qwen35moe` → `Qwen36Moe`（自带 GGUF mmap 生命周期），
+  `device="cpu"` 时同一套代码跑 CPU-only（CI 可用）；
+- 正确性：greedy 生成与 llama.cpp（llama-server `/v1/completions`，同 checkpoint、
+  temperature 0）逐 token 一致（`tests/test_qwen36_moe.py` 固化参考 token）；
+- 性能（RTX 4060 Laptop / 22 核）：decode 稳态约 2.1 tok/s（prompt 逐 token prefill，
+  batched prefill 属 plan 阶段 6）；首 token 延迟受 mmap 页缓存预热影响。
 
-完整阶段、内存预算、风险和验收见
-[docs/qwen36_35b_plan.md](qwen36_35b_plan.md)。当前 `quant/`、`kernels/*/quant_gemv.py`、
-`model/qwen36_moe.py` 是接口和格式表，不包含可运行 kernel。
+尚未做（plan 阶段 6/7）：batched prefill、CUDA graph、tilelang 量化 GEMV kernel、
+专家行常驻 GPU 缓存。当前 decode 的大头是专家 dequant 的 torch 算子开销
+（约 15ms/层），不是带宽。
 
 ## 4. 内存
 

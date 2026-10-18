@@ -1,13 +1,38 @@
-"""Qwen3.6-35B-A3B native loader/model (scaffold only).
+"""Qwen3.6-35B-A3B (qwen35moe) native hybrid decoder.
 
-No weights are materialized here.  The plan is in docs/qwen36_35b_plan.md.
+Placement (docs/qwen36_35b_plan.md section 6): every non-expert tensor is
+dequantized once at load and lives on the GPU in bf16; the 256-expert MoE
+tensors stay as quant bytes in the GGUF mmap and the selected experts are
+staged per token to the compute device where the vectorized dequant + matmul
+runs.  A CPU-only build of the same code serves CI (device="cpu").
+
+Numerical conventions (verified against llama.cpp src/models/qwen35moe.cpp):
+
+* GGUF norm gammas are pre-folded (use ``x * gamma`` directly);
+* ``ssm_a`` stores ``-exp(A_log)`` so the log-decay is ``a * softplus(..)``;
+* the GGUF ``block_count`` includes the MTP block (skipped in the main loop);
+* attention ``attn_q`` outputs ``[q | output-gate]`` per head; RoPE rotates
+  the leading ``rope_dim`` dims with theta 1e7;
+* MoE routing is softmax over all logits, top-k, then renormalize; the
+  shared expert is gated by ``sigmoid(x @ ffn_gate_inp_shexp)``.
 """
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
+import torch
+import torch.nn.functional as F
+
+from breezetoken.backends import _torch_gdn_decode
 from breezetoken.gguf import GGUFFile
+from breezetoken.model.moe import ExpertPool, route
+from breezetoken.quant.tensor import QuantizedTensor
+
+#: Prompt handling: prompts are fed token-by-token (batched prefill is phase 6).
+_DEFAULT_CONTEXT = 8192
 
 
 @dataclass(frozen=True)
@@ -18,7 +43,9 @@ class Qwen36Config:
     n_kv: int
     head_dim: int
     rope_dim: int
+    rope_theta: float
     context_length: int
+    max_context: int
     n_experts: int
     top_k: int
     expert_ffn: int
@@ -27,12 +54,34 @@ class Qwen36Config:
     gdn_value_heads: int
     gdn_k_dim: int
     gdn_v_dim: int
+    gdn_inner: int
     gdn_conv: int
-    nextn_layers: int
+    vocab: int
+    eps: float
+    l2_eps: float
+    ffn: int = 0  # unused, kept for planner-shape compatibility
+    nextn_layers: int = 0
+
+    @property
+    def attn_layers(self) -> tuple[int, ...]:
+        return tuple(i for i in range(self.n_layers) if (i + 1) % self.full_attention_interval == 0)
+
+    @property
+    def full_attention_interval(self) -> int:
+        return 4
+
+    @property
+    def attn_scale(self) -> float:
+        return self.head_dim**-0.5
 
     @classmethod
-    def from_gguf(cls, gguf: GGUFFile) -> Qwen36Config:
+    def from_gguf(cls, gguf: GGUFFile, max_context: int | None = None) -> Qwen36Config:
         md = gguf.metadata
+        context_length = int(md.get("qwen35moe.context_length", 262144))
+        requested = _DEFAULT_CONTEXT if max_context is None else int(max_context)
+        if requested <= 0:
+            raise ValueError("max_context must be positive")
+        context = min(context_length, requested)
         return cls(
             hidden=int(md["qwen35moe.embedding_length"]),
             n_layers=int(md["qwen35moe.block_count"])
@@ -40,8 +89,10 @@ class Qwen36Config:
             n_heads=int(md["qwen35moe.attention.head_count"]),
             n_kv=int(md["qwen35moe.attention.head_count_kv"]),
             head_dim=int(md["qwen35moe.attention.key_length"]),
-            rope_dim=int(md["qwen35moe.rope.dimension_count"]),
-            context_length=int(md["qwen35moe.context_length"]),
+            rope_dim=int(md.get("qwen35moe.rope.dimension_count", 64)),
+            rope_theta=float(md.get("qwen35moe.rope.freq_base", 1.0e7)),
+            context_length=context_length,
+            max_context=context,
             n_experts=int(md["qwen35moe.expert_count"]),
             top_k=int(md["qwen35moe.expert_used_count"]),
             expert_ffn=int(md["qwen35moe.expert_feed_forward_length"]),
@@ -51,16 +102,401 @@ class Qwen36Config:
             // int(md["qwen35moe.ssm.state_size"]),
             gdn_k_dim=int(md["qwen35moe.ssm.state_size"]),
             gdn_v_dim=int(md["qwen35moe.ssm.state_size"]),
+            gdn_inner=int(md["qwen35moe.ssm.inner_size"]),
             gdn_conv=int(md["qwen35moe.ssm.conv_kernel"]),
+            vocab=int(gguf.tensor_info("token_embd.weight")[0][0]),
+            eps=float(md.get("qwen35moe.attention.layer_norm_rms_epsilon", 1e-6)),
+            l2_eps=1e-6,
             nextn_layers=int(md.get("qwen35moe.nextn_predict_layers", 0)),
         )
 
+    def validate(self) -> None:
+        if self.n_layers <= 0:
+            raise ValueError("n_layers must be positive")
+        if self.rope_dim <= 0 or self.rope_dim > self.head_dim or self.rope_dim % 2:
+            raise ValueError(f"invalid rope_dim {self.rope_dim}")
+        if 2 * self.gdn_key_heads * self.gdn_k_dim != self.gdn_inner:
+            raise ValueError("qwen35moe expects 2*key_heads*k_dim == ssm.inner_size")
+        if self.gdn_value_heads * self.gdn_v_dim != self.gdn_inner:
+            raise ValueError("qwen35moe expects value_heads*v_dim == ssm.inner_size")
+
+
+@dataclass(frozen=True)
+class _HybridPlacement:
+    """Component-granular placement summary (non-expert GPU / experts CPU)."""
+
+    max_context: int
+    device: str
+    n_layers: int
+
+    @property
+    def gpu_layers(self) -> int:
+        return self.n_layers if self.device.startswith("cuda") else 0
+
+    @property
+    def head_on_gpu(self) -> bool:
+        return self.device.startswith("cuda")
+
+    def summary(self, total_layers: int) -> str:
+        if self.device.startswith("cuda"):
+            where = f"hybrid[non-expert cuda / {total_layers} layers experts cpu-quant]"
+        else:
+            where = "cpu[experts cpu-quant]"
+        return f"{where} ctx={self.max_context}"
+
+
+class _GDNState:
+    """Convolution window + recurrent state for one GDN layer."""
+
+    def __init__(self, cfg: Qwen36Config, device: str):
+        # conv window covers the qkv projection: 2*key_heads*k_dim (q,k) + inner (v)
+        conv_dim = 2 * cfg.gdn_key_heads * cfg.gdn_k_dim + cfg.gdn_inner
+        self.conv = torch.zeros(conv_dim, cfg.gdn_conv - 1, device=device)
+        inner = cfg.gdn_inner
+        self.rec = torch.zeros(
+            cfg.gdn_value_heads, cfg.gdn_v_dim, inner // cfg.gdn_value_heads, device=device
+        )
+
+    def reset(self) -> None:
+        self.conv.zero_()
+        self.rec.zero_()
+
 
 class Qwen36Moe:
-    """Native 35B decoder; intentionally unimplemented until phase 3."""
+    """Loaded Qwen3.6-35B-A3B decoder with hybrid quant placement."""
 
-    @classmethod
-    def load(cls, *args, **kwargs):
-        raise NotImplementedError(
-            "native Qwen3.6-35B-A3B is not implemented; see docs/qwen36_35b_plan.md"
+    def __init__(
+        self,
+        gguf: GGUFFile | str,
+        *,
+        device: str = "auto",
+        dtype: str | torch.dtype | None = None,
+        max_context: int | None = None,
+        **_ignored,
+    ) -> None:
+        if isinstance(gguf, (str, __import__("pathlib").Path)):
+            gguf = GGUFFile(gguf)
+            self._own_gguf = True
+        else:
+            self._own_gguf = False
+        if dtype in ("f32", "float32"):
+            self.weight_dtype = torch.float32
+        elif dtype in (None, "auto", "bfloat16", "bf16"):
+            self.weight_dtype = torch.bfloat16
+        else:
+            raise ValueError("Qwen36Moe supports dtype auto/bf16/f32")
+        self._gguf = gguf
+        cfg = Qwen36Config.from_gguf(gguf, max_context)
+        cfg.validate()
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        self.placement = _HybridPlacement(cfg.max_context, device, cfg.n_layers)
+        self.cfg = cfg
+        self.experts = ExpertPool(gguf, cfg.n_layers, device)
+        self.layers: list[dict[str, torch.Tensor]] = []
+        self.w: dict[str, torch.Tensor] = {}
+        attn = set(cfg.attn_layers)
+        self._attn_set = frozenset(attn)
+        self._load_nonexpert(gguf)
+        self.kv = {
+            i: (
+                torch.zeros(cfg.n_kv, cfg.max_context, cfg.head_dim, device=device),
+                torch.zeros(cfg.n_kv, cfg.max_context, cfg.head_dim, device=device),
+            )
+            for i in attn
+        }
+        self.states = {i: _GDNState(cfg, device) for i in range(cfg.n_layers) if i not in attn}
+        half = cfg.rope_dim // 2
+        inv = cfg.rope_theta ** (-torch.arange(0, half, device=device, dtype=torch.float32) / half)
+        phases = torch.outer(torch.arange(cfg.max_context, device=device, dtype=torch.float32), inv)
+        self._rope_cos, self._rope_sin = phases.cos(), phases.sin()
+
+    # ------------------------------------------------------------------ load
+    def _weight(self, gguf: GGUFFile, name: str) -> torch.Tensor:
+        """2-D weight kept in its native (out, in) GGUF orientation, as bf16.
+
+        Large tensors load in row chunks so the f32 dequant temporary stays
+        bounded (head/embedding are 248320 rows).
+        """
+        qt = QuantizedTensor.from_gguf(gguf, name)
+        if len(qt.shape) != 2:
+            raise ValueError(f"expected a 2-D weight for {name}, got {qt.shape}")
+        chunk = 8192
+        if qt.rows <= chunk:
+            return qt.load_rows(gguf, 0, qt.rows, self.device).to(self.weight_dtype)
+        parts = [
+            qt.load_rows(gguf, r, min(chunk, qt.rows - r), self.device).to(self.weight_dtype)
+            for r in range(0, qt.rows, chunk)
+        ]
+        return torch.cat(parts)
+
+    def _norm(self, gguf: GGUFFile, name: str) -> torch.Tensor:
+        return gguf.get_tensor(name, dtype=torch.float32).to(self.device)
+
+    def _load_nonexpert(self, gguf: GGUFFile) -> None:
+        cfg = self.cfg
+        self.w["embd"] = self._weight(gguf, "token_embd.weight")  # (V, H) bf16
+        self.w["head"] = self._weight(gguf, "output.weight")  # (V, H) bf16
+        self.w["norm_f"] = self._norm(gguf, "output_norm.weight")
+        for i in range(cfg.n_layers):
+            p = f"blk.{i}."
+            layer: dict[str, torch.Tensor] = {
+                "norm_in": self._norm(gguf, p + "attn_norm.weight"),
+                "norm_post": self._norm(gguf, p + "post_attention_norm.weight"),
+                "router": self._norm(gguf, p + "ffn_gate_inp.weight"),  # (E, H) f32
+                "shexp_gate": self._norm(gguf, p + "ffn_gate_inp_shexp.weight"),
+                "shexp_gu": torch.cat(
+                    [
+                        self._weight(gguf, p + "ffn_gate_shexp.weight"),
+                        self._weight(gguf, p + "ffn_up_shexp.weight"),
+                    ]
+                ),
+                "shexp_down": self._weight(gguf, p + "ffn_down_shexp.weight"),
+            }
+            if i in self._attn_set:
+                layer.update(
+                    q=self._weight(gguf, p + "attn_q.weight"),
+                    k=self._weight(gguf, p + "attn_k.weight"),
+                    v=self._weight(gguf, p + "attn_v.weight"),
+                    o=self._weight(gguf, p + "attn_output.weight"),
+                    q_norm=self._norm(gguf, p + "attn_q_norm.weight"),
+                    k_norm=self._norm(gguf, p + "attn_k_norm.weight"),
+                )
+            else:
+                layer.update(
+                    qkv=self._weight(gguf, p + "attn_qkv.weight"),
+                    z=self._weight(gguf, p + "attn_gate.weight"),
+                    out=self._weight(gguf, p + "ssm_out.weight"),
+                    conv=self._norm(gguf, p + "ssm_conv1d.weight"),  # (3*inner, conv)
+                    w_alpha=self._norm(gguf, p + "ssm_alpha.weight"),  # (nv, H)
+                    w_beta=self._norm(gguf, p + "ssm_beta.weight"),
+                    a_log=self._norm(gguf, p + "ssm_a"),
+                    dt_bias=self._norm(gguf, p + "ssm_dt.bias"),
+                    ssm_norm=self._norm(gguf, p + "ssm_norm.weight"),
+                )
+            self.layers.append(layer)
+
+    # ------------------------------------------------------------------ ops
+    @staticmethod
+    def _rms(x: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * gamma
+
+    def _linear(self, w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """w is (out, in); returns f32 (out,)."""
+        return (w @ x.reshape(-1).to(w.dtype)).float()
+
+    def _rope(self, x: torch.Tensor, pos: int) -> torch.Tensor:
+        cfg = self.cfg
+        rot = x[..., : cfg.rope_dim]
+        rest = x[..., cfg.rope_dim :]
+        half = cfg.rope_dim // 2
+        cos = self._rope_cos[pos].unsqueeze(0)
+        sin = self._rope_sin[pos].unsqueeze(0)
+        rotated = torch.cat(
+            (
+                rot[..., :half] * cos - rot[..., half:] * sin,
+                rot[..., :half] * sin + rot[..., half:] * cos,
+            ),
+            dim=-1,
         )
+        return torch.cat((rotated, rest), dim=-1)
+
+    def _attn(self, i: int, xn: torch.Tensor, pos: int) -> torch.Tensor:
+        cfg = self.cfg
+        layer = self.layers[i]
+        H, D = cfg.n_heads, cfg.head_dim
+        q_full = self._linear(layer["q"], xn).view(H, 2 * D)
+        q, gate = q_full[:, :D], q_full[:, D:]
+        k = self._linear(layer["k"], xn).view(cfg.n_kv, D)
+        v = self._linear(layer["v"], xn).view(cfg.n_kv, D)
+        q = self._rms(q, layer["q_norm"], cfg.eps)
+        k = self._rms(k, layer["k_norm"], cfg.eps)
+        q = self._rope(q, pos)
+        k = self._rope(k, pos)
+        k_cache, v_cache = self.kv[i]
+        k_cache[:, pos] = k
+        v_cache[:, pos] = v
+        seq = pos + 1
+        out = F.scaled_dot_product_attention(
+            q.view(1, H, 1, D),  # (B, H, L, D)
+            k_cache[:, :seq].unsqueeze(0),  # (1, Hkv, S, D)
+            v_cache[:, :seq].unsqueeze(0),
+            is_causal=False,
+            scale=cfg.attn_scale,
+            enable_gqa=True,
+        ).view(H, D)
+        out = out * torch.sigmoid(gate)
+        return self._linear(layer["o"], out.reshape(-1))
+
+    def _gdn(self, i: int, xn: torch.Tensor) -> torch.Tensor:
+        cfg = self.cfg
+        layer = self.layers[i]
+        state = self.states[i]
+        hk, hv, dk = cfg.gdn_key_heads, cfg.gdn_value_heads, cfg.gdn_k_dim
+        inner = cfg.gdn_inner
+        entry = self._linear(layer["qkv"], xn)  # (3*inner,)
+        window = torch.cat((state.conv, entry.unsqueeze(1)), dim=1)
+        mixed = F.silu((window * layer["conv"]).sum(dim=-1))
+        state.conv.copy_(window[:, 1:])
+        q = mixed[: inner // 2].view(hk, dk)
+        k = mixed[inner // 2 : inner].view(hk, dk)
+        v = mixed[inner:].view(hv, dk)
+        beta = self._linear(layer["w_beta"], xn)
+        g = layer["a_log"].float() * F.softplus(
+            self._linear(layer["w_alpha"], xn) + layer["dt_bias"].float()
+        )
+        read = _torch_gdn_decode(q, k, v, g, beta, state.rec, dk**-0.5, cfg.l2_eps)
+        z = self._linear(layer["z"], xn).view(hv, dk)
+        normed = self._rms(read, layer["ssm_norm"], cfg.eps)
+        gated = (normed * F.silu(z)).reshape(-1)
+        return self._linear(layer["out"], gated)
+
+    def _moe(self, i: int, xn: torch.Tensor) -> torch.Tensor:
+        layer = self.layers[i]
+        routing = route(xn, layer["router"], self.cfg.top_k)
+        routed = self.experts.forward(i, self._gguf, xn, routing)
+        gu = self._linear(layer["shexp_gu"], xn)
+        ffn = self.cfg.shared_ffn
+        shared = self._linear(layer["shexp_down"], F.silu(gu[:ffn]) * gu[ffn:])
+        gate = torch.sigmoid(self._linear(layer["shexp_gate"], xn))
+        return routed + gate * shared
+
+    # ------------------------------------------------------------------ step
+    @torch.inference_mode()
+    def forward_token(self, token: int, pos: int, *, logits: bool = True):
+        cfg = self.cfg
+        if not 0 <= pos < cfg.max_context:
+            raise ValueError(f"position {pos} outside [0, {cfg.max_context})")
+        h = self.w["embd"][token].float()
+        for i in range(cfg.n_layers):
+            layer = self.layers[i]
+            xn = self._rms(h, layer["norm_in"], cfg.eps)
+            mixer = self._attn(i, xn, pos) if i in self._attn_set else self._gdn(i, xn)
+            h = h + mixer
+            xn = self._rms(h, layer["norm_post"], cfg.eps)
+            h = h + self._moe(i, xn)
+        if not logits:
+            return None
+        xn = self._rms(h, self.w["norm_f"], cfg.eps)
+        return self._linear(self.w["head"], xn)  # (V,) f32
+
+    def reset(self) -> None:
+        for state in self.states.values():
+            state.reset()
+
+    # ------------------------------------------------------------- generate
+    def _sample(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        generator: torch.Generator | None,
+    ) -> int:
+        if temperature <= 0.0:
+            return int(logits.argmax())
+        probs = torch.softmax(logits.float() / temperature, dim=-1)
+        if top_p < 1.0:
+            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            cutoff = cumulative - sorted_probs > top_p
+            sorted_probs = torch.where(cutoff, 0.0, sorted_probs)
+            probs = torch.zeros_like(probs).scatter_(0, sorted_idx, sorted_probs)
+            probs = probs / probs.sum()
+        return int(torch.multinomial(probs, 1, generator=generator).item())
+
+    def generate_stream(
+        self,
+        ids: Sequence[int],
+        max_new: int,
+        temperature: float = 0.0,
+        *,
+        top_p: float = 1.0,
+        eos_ids: Sequence[int] = (),
+        cancel: threading.Event | None = None,
+        seed: int | None = None,
+    ) -> Iterator[int]:
+        if not ids:
+            raise ValueError("prompt must contain at least one token")
+        if max_new < 0:
+            raise ValueError("max_new must be >= 0")
+        if temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if len(ids) + max_new > self.cfg.max_context:
+            raise ValueError(
+                f"prompt {len(ids)} + max_new {max_new} exceeds max_context {self.cfg.max_context}"
+            )
+        if max_new == 0:
+            return
+        if cancel is not None and cancel.is_set():
+            return
+
+        self.reset()
+        eos = frozenset(eos_ids)
+        generator = None
+        if temperature > 0:
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(int(seed) if seed is not None else 0)
+
+        last = len(ids) - 1
+        logits = None
+        for i, token in enumerate(ids):
+            if cancel is not None and cancel.is_set():
+                return
+            logits = self.forward_token(token, i, logits=(i == last))
+        assert logits is not None
+
+        for step in range(max_new):
+            if cancel is not None and cancel.is_set():
+                return
+            nxt = self._sample(logits, temperature, top_p, generator)
+            if nxt in eos:
+                return
+            yield nxt
+            if step + 1 >= max_new:
+                return
+            if cancel is not None and cancel.is_set():
+                return
+            logits = self.forward_token(nxt, len(ids) + step, logits=True)
+
+    def generate(
+        self,
+        ids: Sequence[int],
+        max_new: int,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> list[int]:
+        return list(self.generate_stream(ids, max_new, temperature, **kwargs))
+
+    def warmup(self) -> None:
+        self.reset()
+        self.forward_token(0, 0, logits=True)
+        self.reset()
+
+    def close(self) -> None:
+        self.layers.clear()
+        self.w.clear()
+        self.kv.clear()
+        self.states.clear()
+        if self._own_gguf:
+            self._gguf.close()
+
+    @property
+    def backend(self):
+        class _Info:
+            name = "hybrid-quant"
+
+        return _Info()
+
+    def __repr__(self) -> str:
+        cfg = self.cfg
+        return (
+            f"Qwen36Moe(hidden={cfg.hidden}, layers={cfg.n_layers}, "
+            f"experts={cfg.n_experts}top{cfg.top_k}, max_context={cfg.max_context}, "
+            f"{self.placement.summary(cfg.n_layers)}, dtype={self.weight_dtype})"
+        )
+
+
+__all__ = ["Qwen36Config", "Qwen36Moe"]
