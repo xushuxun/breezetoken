@@ -62,6 +62,7 @@ class Settings:
     dtype: str | None = None
     max_context: int | None = None
     max_new_tokens: int = 4096
+    mtp: bool = False
     warmup: bool = True
     host: str = "127.0.0.1"
     port: int = 8321
@@ -302,6 +303,7 @@ def create_app(settings: Settings, engine: Engine | None = None) -> FastAPI:
                     device=settings.device,
                     dtype=settings.dtype,
                     max_context=settings.max_context,
+                    mtp=settings.mtp,
                 )
                 app.state.engine = loaded
             if settings.warmup:
@@ -597,6 +599,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-context", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="enable MTP/nextn speculative decoding (greedy only; experimental)",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8321)
     parser.add_argument("--log-level", default="info")
@@ -616,6 +623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dtype=args.dtype,
         max_context=args.max_context,
         max_new_tokens=args.max_new_tokens,
+        mtp=args.mtp,
         warmup=args.warmup,
         host=args.host,
         port=args.port,

@@ -13,8 +13,10 @@ GPU 前缀与 CPU 后缀组合起来。0.8B 在 8GB 卡上直接全 GPU；更大
 - **模型**：Qwen3.5-0.8B（24 层 = 18 GDN + 6 GQA）原生 kernel。Qwen3.6-35B-A3B
   （40 层 = 30 GDN + 10 GQA，256 experts/top-8，IQ3_S）已实现原生混合执行：
   非专家权重 dequant 成 bf16 上 GPU，专家张量保持 mmap 量化字节、按 token
-  把 top-8 专家 stage 到计算设备 dequant + matmul（greedy 与 llama.cpp
-  逐 token 一致，decode 约 2 tok/s；细节见 [docs/qwen36_35b_plan.md](docs/qwen36_35b_plan.md)）。
+  把 top-8 专家 stage 到 GPU 后由融合量化 GEMV kernel（tilelang CUDA）直接
+  解码+点积；greedy 与 llama.cpp 逐 token 一致，decode 约 6 tok/s、批量
+  prefill 17–36 tok/s（RTX 4060 Laptop；MTP 投机解码 `--mtp` 已可用但默认关，
+  性能分析见 [docs/qwen36_35b_plan.md](docs/qwen36_35b_plan.md)）。
 - **权重**：GGUF v3 mmap 读取，Q8_0/f32，分块反量化以限制峰值内存；embedding 与
   lm_head 共用一份 `(H, V)` 权重。
 - **tokenizer**：HuggingFace Rust `tokenizers` 从 GGUF 元数据重建；NFC、与
@@ -72,6 +74,9 @@ uv run breezetoken --prompt "The capital of France is" --raw --max-new-tokens 4
 uv run breezetoken \
   --model ~/.cache/modelscope/models/unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/master/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
   --prompt "你好" --max-new-tokens 32
+
+# 35B + MTP 投机解码（实验性，greedy 专用；输出与 plain greedy 无损一致）
+uv run breezetoken --model .../Qwen3.6-35B-A3B-UD-IQ3_S.gguf --mtp --prompt "你好"
 
 # 只看自动放置结果（正常使用不需要传 backend/device）
 uv run breezetoken --prompt "你好"

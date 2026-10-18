@@ -72,3 +72,27 @@ def test_cpu_only_forward() -> None:
         assert torch.isfinite(logits).all()
     finally:
         eng.close()
+
+
+def test_mtp_matches_plain_greedy(engine) -> None:
+    """Speculative decoding must be lossless w.r.t. plain greedy."""
+    if engine.model.mtp is None:
+        pytest.skip("checkpoint has no MTP block")
+    ids = engine.encode(PROMPT)
+    plain = list(engine.generate_stream(ids, 12, 0.0))
+    engine.model._use_mtp = True
+    try:
+        mtp = list(engine.generate_stream(ids, 12, 0.0))
+    finally:
+        engine.model._use_mtp = False
+    assert mtp == plain
+
+
+def test_batched_prefill_matches_sequential(engine) -> None:
+    ids = engine.encode(PROMPT)
+    logits_b, _ = engine.model._prefill_batch(ids)
+    engine.model.reset()
+    logits_s = None
+    for i, t in enumerate(ids):
+        logits_s = engine.model.forward_token(t, i, logits=(i == len(ids) - 1))
+    assert int(logits_b.argmax()) == int(logits_s.argmax())

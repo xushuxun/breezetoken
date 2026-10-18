@@ -154,8 +154,12 @@ Qwen3.6-35B-A3B 是 `qwen35moe`、IQ3_S、15GB、40 层、256 experts/top-8。�
   IQ 网格表，逐位对齐验证）；
 - **分量级混合放置**：非专家权重（attention/GDN/shared/head/embd）加载时 dequant
   成 bf16 上 GPU（约 4.7 GiB）；专家张量保持 mmap 量化的字节留在 CPU，decode 时
-  按 top-8 把原始量化字节经 pinned buffer 一次性 stage 到 GPU，在同一设备上
-  dequant + matmul（`model/moe.py::ExpertPool`，gate/up 融合成一次 GEMV）；
+  按 top-8 把原始量化字节经 pinned buffer 一次性 stage 到 GPU，由**融合量化 GEMV
+  kernel**（tilelang CUDA，iq2_s gate/up + iq4_xs down）直接解码+点积，不做 f32
+  物化（`model/moe.py::ExpertPool`）。专家常驻 GPU 不可行：13 GiB 量化字节 +
+  4.7 GiB 非专家 + KV/workspace 超过 8 GiB 显存；且实测每层 staging 仅约
+  1 ms，瓶颈从不在 CPU 取数。head 走 split-K bf16 GEMV kernel，GDN 递归走
+  tilelang delta-rule kernel（value head 取 `v % key_heads`，与 ggml 一致）；
 - GDN 16K/32V（注意：value head v 取 key head `v % 16`，与 ggml fused kernel
   一致，不是 GQA 的 `//` 分组）、attention 16Q/2KV + output gate、partial
   RoPE(64, θ=1e7)、router softmax/top-8/重归一化、scalar sigmoid 门控 shared expert；
@@ -163,12 +167,18 @@ Qwen3.6-35B-A3B 是 `qwen35moe`、IQ3_S、15GB、40 层、256 experts/top-8。�
   `device="cpu"` 时同一套代码跑 CPU-only（CI 可用）；
 - 正确性：greedy 生成与 llama.cpp（llama-server `/v1/completions`，同 checkpoint、
   temperature 0）逐 token 一致（`tests/test_qwen36_moe.py` 固化参考 token）；
-- 性能（RTX 4060 Laptop / 22 核）：decode 稳态约 2.1 tok/s（prompt 逐 token prefill，
-  batched prefill 属 plan 阶段 6）；首 token 延迟受 mmap 页缓存预热影响。
+  融合 kernel 与 torch dequant 参考逐元素对齐（`tests/test_quant_gemv.py`）；
+  MTP 投机输出与 plain greedy 完全一致（无损，`--mtp` 开启）；
+- 性能（RTX 4060 Laptop / 22 核）：decode 稳态约 **6 tok/s**（greedy）；
+  批量 prefill（prompt≥8）约 17–36 tok/s。decode 的物理上限 ~52 steps/s
+  （4.7 GiB bf16 权重 ÷ ~250 GB/s 显存带宽），50 tok/s 需要 MTP 接受率 ≥2
+  加上 decode 步进 CUDA 图捕获；prefill >1000 tok/s 在此硬件不可达
+  （每批必须经 PCIe 搬动被触发的专家权重）。`--mtp` 已实现（接受率 ~0.88）
+  但因 verify+状态回放成本暂默认关闭，达标路径见 plan 阶段 7。
 
-尚未做（plan 阶段 6/7）：batched prefill、CUDA graph、tilelang 量化 GEMV kernel、
-专家行常驻 GPU 缓存。当前 decode 的大头是专家 dequant 的 torch 算子开销
-（约 15ms/层），不是带宽。
+尚未做（plan 阶段 6/7 剩余）：decode 步进 CUDA graph、verify 用 per-position
+GDN 状态快照（去掉回放）、M≤2 的融合专家 GEMM（让 verify ≈ 一步）、
+chunked GDN scan（prefill 提速）、专家行常驻 GPU 缓存。
 
 ## 4. 内存
 

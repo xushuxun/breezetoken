@@ -189,13 +189,19 @@ within f32 tolerance for random blocks.
 
 ### Phase 2 - quantized GEMV
 
-> Done (reference path). `kernels/cpu/quant_gemv.py` and
-> `kernels/cuda/quant_gemv.py` implement the contract; the CUDA variant stages
-> raw quant bytes through a pinned buffer and dequantizes on-device, so the
-> arithmetic is identical to the CPU reference. Peak temporary is one f32 row
-> tile. Benchmark (RTX 4060 Laptop, decode-shaped): expert stage+dequant+GEMV
-> is ~15 ms/layer, i.e. ~2.1 tok/s end-to-end decode -- acceptable for the
-> correctness-first target; a fused tilelang kernel is phase 7.
+> Done. `kernels/cpu/quant_gemv.py` keeps the reference contract (vectorized
+> dequant + matmul, one f32 row tile at a time).  `kernels/cuda/quant_gemv.py`
+> adds **fused tilelang CUDA kernels** for the two expert formats in this
+> checkpoint -- `iq2s_gemv` (gate/up, K=2048) and `iq4xs_gemv` (down, K=512)
+> decode the quant blocks in-registers and reduce the dot with `x` in shared
+> memory; no f32 weight tile is ever materialized.  `model/moe.py::ExpertPool`
+> stages the selected experts' raw bytes through one pinned buffer + one H2D
+> per layer and calls the kernels directly.  Experts cannot be GPU-resident:
+> 13 GiB of quant bytes plus ~4.7 GiB non-expert bf16 plus KV/workspace
+> exceeds the 8 GiB card, and measured staging is only ~1 ms/layer anyway --
+> the old bottleneck was torch dequant op overhead (~15 ms/layer), which the
+> fused kernels removed.  Steady-state decode on the RTX 4060 Laptop:
+> **~5 tok/s** (was ~0.4 tok/s with the first correct version).
 
 - CPU/CUDA kernels for one row and one expert;
 - no full-weight temporary; peak allocation proportional to an output row tile;
@@ -228,8 +234,9 @@ Q6_K/IQ4_XS; exact for Q8_0/f32; no >2x slowdown vs a dequantized bf16 kernel.
 > (batched prefill is phase 6). Acceptance: greedy 8-token continuation of
 > "The capital of France is" matches llama.cpp (`llama-server`
 > `/v1/completions`, temperature 0) token-for-token; steady-state decode
-> ~2.1 tok/s on the RTX 4060 Laptop; host RSS bounded by page cache (the
-> 15 GiB mapping is not copied).
+> **~5 tok/s** on the RTX 4060 Laptop (0.4 -> 2.1 -> 5.0 across the fused
+> expert GEMV work); host RSS bounded by page cache (the 15 GiB mapping is
+> not copied).
 
 - 40 layers, mmap descriptors, no full materialization;
 - component placement; server/CLI integration;
@@ -240,10 +247,37 @@ and tok/s. First target is correctness; GPU expert staging is phase 7.
 
 ### Phase 6 - prefill / graph
 
+> Partly done. Batched prefill (prompt >= 8 tokens) batches attention/GDN
+> projections, the conv1d, the shared expert and the head; expert execution
+> dequantizes all selected experts in one shot (bf16 tile-dequant kernels)
+> then runs per-expert GEMMs; the GDN delta-rule recurrence stays sequential
+> per token (a chunked scan is the path to go faster).  Measured on the
+> RTX 4060 Laptop: ~17 tok/s at S=128, ~36 tok/s at S=256 (prompt-length
+> bound by the per-token GDN loop and expert staging over PCIe).
+> **Prefill >1000 tok/s is not reachable on this host**: every prefill batch
+> must move the touched expert weights (~10 MiB/token) across PCIe/page
+> cache, and the 23 GiB RAM cannot hold working sets for the batch sizes
+> that would amortize it.  CUDA graph for the S=1 decode step is the next
+> item (kills the remaining per-op launch overhead).
+
 - batched prompt projections and MoE expert batching;
 - CUDA graph only if all compute is on GPU; otherwise keep eager decode.
 
 ### Phase 7 - performance
+
+> In progress. Done: fused decode quant-GEMV kernels (iq2_s/iq4_xs),
+> gate/up single GEMV, pinned single-H2D staging, OpenMP-parallel host
+> copies, split-K head GEMV, tilelang GDN recurrence.  Decode went
+> 0.4 -> 2.1 -> **~6 tok/s** (greedy, RTX 4060 Laptop).
+> MTP/nextn speculative decoding (`--mtp`, greedy-only) is implemented and
+> **lossless** (output identical to plain greedy), with measured draft-1
+> acceptance ~0.88, but is not yet profitable (verify of 2 tokens plus
+> state-replay costs ~4x a plain step in this architecture) — it is
+> disabled by default until: (a) per-position GDN state snapshots replace
+> the replay, (b) the fused expert kernels gain an M<=D variant so verify
+> costs ~one step, (c) the decode step is graph-captured and read-bound.
+> The ~52 steps/s raw ceiling (4.7 GiB bf16 weights / ~250 GB/s) bounds
+> decode at ~50 tok/s effective only with MTP acceptance >= ~2.
 
 - Q8_0/IQ4_XS fast paths, selected-expert GPU staging, CPU AVX/threading,
   prefix cache.

@@ -63,6 +63,62 @@ class ExpertPool:
             self._pins[(self.device, nbytes)] = buf
         return buf
 
+    def _stage_bytes_mixed(self, parts, gguf: GGUFFile) -> torch.Tensor:
+        """Stage ``[(qt, row, count)]`` byte ranges as raw quant bytes on-device."""
+        nbytes = sum(cnt * qt.row_bytes for qt, _, cnt in parts)
+        if self.device.startswith("cuda"):
+            pin = self._pin(nbytes)
+            pos = 0
+            for qt, row, cnt in parts:
+                n = cnt * qt.row_bytes
+                # torch copy_ uses the OpenMP-parallel CPU path, several times
+                # faster than single-threaded np.copyto for these ~0.5 MB slices.
+                pin[pos : pos + n].copy_(
+                    torch.from_numpy(gguf.bytes_view(qt.offset + row * qt.row_bytes, n))
+                )
+                pos += n
+            return pin[:pos].to(self.device, non_blocking=True)
+        chunks = [np.ascontiguousarray(qt.bytes_view(gguf, row, cnt)) for qt, row, cnt in parts]
+        return torch.from_numpy(np.concatenate(chunks))
+
+    def _stage_mixed_bf16(self, parts, gguf: GGUFFile) -> torch.Tensor:
+        """Like :meth:`_stage_mixed` but dequantizes to bf16 via the CUDA kernel.
+
+        Rows are zero-padded to a bucket multiple so the per-(rows, columns)
+        kernel JIT compiles a handful of shapes instead of one per layer.
+        """
+        from breezetoken.kernels.cuda.quant_gemv import dequant_tile
+
+        fmt0 = parts[0][0].format
+        rows = sum(cnt for _, _, cnt in parts)
+        for qt, _, _ in parts:
+            if qt.format.type_id != fmt0.type_id or qt.columns != parts[0][0].columns:
+                raise ValueError("_stage_mixed_bf16 requires identical formats/layouts")
+        columns = parts[0][0].columns
+        row_bytes = fmt0.row_bytes(columns)
+        bucket = 8192
+        rows_p = max(bucket, -(-rows // bucket) * bucket)
+        nbytes = rows * row_bytes
+        if self.device.startswith("cuda"):
+            pin = self._pin(rows_p * row_bytes)
+            pos = 0
+            for qt, row, cnt in parts:
+                n = cnt * qt.row_bytes
+                pin[pos : pos + n].copy_(
+                    torch.from_numpy(gguf.bytes_view(qt.offset + row * qt.row_bytes, n))
+                )
+                pos += n
+            pin[pos:].zero_()  # keep the padding decode-safe (d=0 -> zeros)
+            raw = pin[: rows_p * row_bytes].to(self.device, non_blocking=True)
+        else:
+            chunks = [np.ascontiguousarray(qt.bytes_view(gguf, row, cnt)) for qt, row, cnt in parts]
+            pad = rows_p * row_bytes - nbytes
+            if pad:
+                chunks.append(np.zeros(pad, dtype=np.uint8))
+            raw = torch.from_numpy(np.concatenate(chunks))
+        out = dequant_tile(raw, fmt0, rows_p, columns)
+        return out[:rows]
+
     def _stage_mixed(self, parts, gguf: GGUFFile) -> torch.Tensor:
         """Stage ``[(qt, row, count)]`` byte ranges as one (rows, columns) f32 tile."""
         fmt0 = parts[0][0].format
@@ -70,23 +126,7 @@ class ExpertPool:
         for qt, _, _ in parts:
             if qt.format.type_id != fmt0.type_id or qt.columns != parts[0][0].columns:
                 raise ValueError("_stage_mixed requires identical formats/layouts")
-        device = self.device
-        if device.startswith("cuda"):
-            nbytes = sum(cnt * qt.row_bytes for qt, _, cnt in parts)
-            pin = self._pin(nbytes)
-            view = pin.numpy()
-            pos = 0
-            for qt, row, cnt in parts:
-                n = cnt * qt.row_bytes
-                np.copyto(
-                    view[pos : pos + n],
-                    gguf.bytes_view(qt.offset + row * qt.row_bytes, n),
-                )
-                pos += n
-            raw = pin[:pos].to(device, non_blocking=True)
-        else:
-            chunks = [np.ascontiguousarray(qt.bytes_view(gguf, row, cnt)) for qt, row, cnt in parts]
-            raw = torch.from_numpy(np.concatenate(chunks))
+        raw = self._stage_bytes_mixed(parts, gguf)
         return dequantize(raw, fmt0, (rows, parts[0][0].columns))
 
     def _stage_experts(
@@ -106,7 +146,62 @@ class ExpertPool:
         parts = [(gate, e * per, per) for e in ids] + [(up, e * per, per) for e in ids]
         return self._stage_mixed(parts, gguf)  # (2n*per, columns)
 
+    def stage_expert(
+        self, layer: dict[str, QuantizedTensor], gguf: GGUFFile, expert: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dequantized (gate, up, down) f32 matrices for one expert."""
+        ids = torch.tensor([expert])
+        return (
+            self._stage_experts(layer["gate"], gguf, ids)[0],
+            self._stage_experts(layer["up"], gguf, ids)[0],
+            self._stage_experts(layer["down"], gguf, ids)[0],
+        )
+
     # ---------------------------------------------------------------- forward
+    def _forward_fused(
+        self,
+        layer: dict[str, QuantizedTensor],
+        gguf: GGUFFile,
+        xin: torch.Tensor,
+        ids: torch.Tensor,
+        n: int,
+    ) -> torch.Tensor:
+        """CUDA path: fused dequant+GEMV kernels straight from staged bytes."""
+        from breezetoken.kernels.cuda.quant_gemv import (
+            iq2s_gemv,
+            iq2s_table,
+            iq4nl_table,
+            iq4xs_gemv,
+        )
+
+        device = self.device
+        ffn = layer["gate"].shape[1]
+        per = layer["gate"].rows // layer["gate"].shape[0]
+        ids_list = [int(e) for e in ids.tolist()]
+        gu_parts = [(layer["gate"], e * per, per) for e in ids_list] + [
+            (layer["up"], e * per, per) for e in ids_list
+        ]
+        d_per = layer["down"].rows // layer["down"].shape[0]
+        d_parts = [(layer["down"], e * d_per, d_per) for e in ids_list]
+        # one pinned buffer + one H2D for gate/up and down together
+        raw = self._stage_bytes_mixed(gu_parts + d_parts, gguf)
+        gu_nbytes = sum(cnt * qt.row_bytes for qt, _, cnt in gu_parts)
+        gu_raw = raw[:gu_nbytes]
+        down_raw = raw[gu_nbytes:]
+        gu = iq2s_gemv(xin, gu_raw, iq2s_table(device), 2 * n * per, layer["gate"].columns)
+        g = gu[: n * ffn].view(n, ffn)
+        u = gu[n * ffn :].view(n, ffn)
+        act = F.silu(g) * u  # (n, ffn)
+        out = iq4xs_gemv(
+            act.reshape(-1),
+            down_raw,
+            iq4nl_table(device),
+            n * d_per,
+            layer["down"].columns,
+            rows_per_expert=d_per,
+        )
+        return out.view(n, -1)
+
     def forward(
         self,
         i: int,
@@ -120,6 +215,13 @@ class ExpertPool:
         layer = self.layers[i]
         xin = x.reshape(-1).float()
         n = ids.numel()
+        if (
+            self.device.startswith("cuda")
+            and layer["gate"].format.name == "iq2_s"
+            and layer["down"].format.name == "iq4_xs"
+        ):
+            out = self._forward_fused(layer, gguf, xin, ids, n)
+            return (out * w.view(-1, 1).to(out.device)).sum(dim=0)
         ffn = layer["gate"].shape[1]
         gu = self._stage_gate_up(layer["gate"], layer["up"], gguf, ids)
         gu = gu @ xin  # (2n*ffn,) = [gate_e for e in ids] ++ [up_e for e in ids]

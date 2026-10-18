@@ -54,6 +54,11 @@ def _parser() -> argparse.ArgumentParser:
         "--dtype", default=None, help="auto, float32, bfloat16 (tilelang CUDA: bfloat16)"
     )
     parser.add_argument("--max-context", type=int, default=None)
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="enable MTP/nextn speculative decoding (greedy only; experimental)",
+    )
     parser.add_argument("--no-warmup", action="store_true")
     return parser
 
@@ -90,6 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             device=args.device,
             dtype=args.dtype,
             max_context=args.max_context,
+            mtp=args.mtp,
         )
         load_seconds = time.perf_counter() - started
         if not args.no_warmup:

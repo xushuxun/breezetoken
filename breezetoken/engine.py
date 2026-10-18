@@ -34,6 +34,7 @@ class Engine:
         device: str = "auto",
         dtype: str | None = None,
         max_context: int | None = None,
+        mtp: bool = False,
     ) -> Engine:
         path = Path(model_path)
         if not path.is_file():
@@ -51,6 +52,7 @@ class Engine:
                     dtype=dtype,
                     max_context=max_context,
                     backend=backend,
+                    mtp=mtp,
                 )
                 return cls(model=model, tokenizer=tokenizer, model_id=model_id)
             native_quant = all(
