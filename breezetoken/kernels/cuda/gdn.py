@@ -6,10 +6,15 @@ advances one value-column tile of the recurrent state per block and returns a
 new state; this version updates the caller's f32 state in place, which is how
 the decode loop wants it.
 
-One token, one f32 state ``[heads, K, V]`` with ``K == V`` in (64, 128).
+One token, one f32 state ``[value_heads, K, V]`` with ``K == V`` in (64, 128).
 Each block owns 32 value columns of one head; a lane group of two splits the
 key dimension.  The query/key L2 normalization, the beta sigmoid and the gated
 decay are fused here, so the model only computes the projections around it.
+
+Qwen3.5-0.8B has one key head per value head.  The kernel also accepts
+``value_heads > key_heads`` (e.g. 35B-A3B's 32 value / 16 key heads): value
+head ``h`` reads key/query head ``h // (value_heads // key_heads)``, matching
+the GQA-style grouping used by the reference kernels.
 """
 
 from functools import cache
@@ -24,13 +29,16 @@ WARP_SHUFFLE_STAGES = 5
 
 @cache
 def gdn_decode(
-    heads: int,
+    heads_k: int,
+    heads_v: int,
     dim: int,
     scale: float,
     threads: int = 64,
     lane_group: int = 2,
 ):
-    """Build the decode kernel for ``[heads, dim, dim]`` f32 state."""
+    """Build the decode kernel for ``[heads_v, dim, dim]`` f32 state."""
+    if heads_k <= 0 or heads_v <= 0 or heads_v % heads_k:
+        raise ValueError("value head count must be a positive multiple of key heads")
     if dim not in (64, 128):
         raise ValueError(f"GDN decode requires K == V in (64, 128), got {dim}")
     if threads % WARP_LANES or lane_group % 1 or WARP_LANES % lane_group:
@@ -41,7 +49,8 @@ def gdn_decode(
     if dim % value_tile:
         raise ValueError(f"dim must be divisible by the {value_tile} columns per block")
     value_tiles = dim // value_tile
-    total_blocks = heads * value_tiles
+    total_blocks = heads_v * value_tiles
+    group = heads_v // heads_k
     k_chunk = dim // lane_group
     lane_group_stages = lane_group.bit_length() - 1
     l2_eps = 1e-6
@@ -50,18 +59,19 @@ def gdn_decode(
     def _decode():
         @T.prim_func
         def kernel(
-            q: T.Tensor((1, 1, heads, dim), "float32"),
-            k: T.Tensor((1, 1, heads, dim), "float32"),
-            v: T.Tensor((1, 1, heads, dim), "float32"),
-            g: T.Tensor((1, 1, heads), "float32"),
-            beta: T.Tensor((1, 1, heads), "float32"),
-            state: T.Tensor((1, heads, dim, dim), "float32"),
-            o: T.Tensor((1, 1, heads, dim), "float32"),
+            q: T.Tensor((1, 1, heads_k, dim), "float32"),
+            k: T.Tensor((1, 1, heads_k, dim), "float32"),
+            v: T.Tensor((1, 1, heads_v, dim), "float32"),
+            g: T.Tensor((1, 1, heads_v), "float32"),
+            beta: T.Tensor((1, 1, heads_v), "float32"),
+            state: T.Tensor((1, heads_v, dim, dim), "float32"),
+            o: T.Tensor((1, 1, heads_v, dim), "float32"),
         ):
             with T.Kernel(total_blocks, threads=threads) as (block,):
                 tx = T.get_thread_binding()
                 value_tile_idx = block % value_tiles
                 head_idx = block // value_tiles
+                key_head = head_idx // group
                 value_lane = tx // lane_group
                 k_rank = tx - value_lane * lane_group
                 value_idx = value_tile_idx * value_tile + value_lane
@@ -78,8 +88,8 @@ def gdn_decode(
                 for i in T.serial(T.ceildiv(dim, threads)):
                     kk = tx + i * threads
                     if kk < dim:
-                        k_shared[kk] = k[0, 0, head_idx, kk]
-                        q_shared[kk] = q[0, 0, head_idx, kk]
+                        k_shared[kk] = k[0, 0, key_head, kk]
+                        q_shared[kk] = q[0, 0, key_head, kk]
                 T.sync_threads()
 
                 # L2-normalize q and k; every warp folds the whole row and the

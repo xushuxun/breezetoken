@@ -20,6 +20,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,18 @@ class Backend(ABC):
         """One decode matvec: ``x`` (..., K) times ``w`` (K, N)."""
 
     @abstractmethod
+    def linear_batch(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """Prefill projection: ``x`` (S, K) times ``w`` (K, N)."""
+
+    @abstractmethod
     def rms_norm(self, x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         """RMSNorm over the last dimension, with a flat learned weight."""
+
+    @abstractmethod
+    def attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+    ) -> torch.Tensor:
+        """GQA decode attention; q (H, D), k/v (S, Hkv, D) -> (H, D)."""
 
     @abstractmethod
     def rope(
@@ -100,11 +111,45 @@ class TorchBackend(Backend):
             raise ValueError(f"linear shape mismatch: x {tuple(x.shape)}, w {tuple(w.shape)}")
         return (x.reshape(-1).float() @ w.float()).reshape(-1)
 
+    def linear_batch(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != w.shape[0]:
+            raise ValueError(f"linear_batch shape mismatch: {tuple(x.shape)} x {tuple(w.shape)}")
+        return x.float() @ w.float()
+
     def rms_norm(self, x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         if x.shape[-1] != w.numel():
             raise ValueError(f"rms_norm shape mismatch: x {tuple(x.shape)}, w {tuple(w.shape)}")
         xf = x.float()
         return xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()
+
+    def attention(self, q, k, v, scale):
+        return _torch_attention(q, k, v, scale)
+
+    def attention_fixed(self, q, k, v, pos, scale):
+        """Fixed-capacity attention used inside the CUDA graph (CUDA only)."""
+        heads, dim = q.shape
+        groups = k.shape[1]
+        cap = k.shape[0]
+        if not (
+            self._family == "cuda"
+            and q.dtype == torch.float32
+            and k.dtype == torch.float32
+            and v.dtype == torch.float32
+            and heads == 8
+            and groups == 2
+            and dim == 256
+            and k.shape == (cap, groups, dim)
+            and v.shape == k.shape
+        ):
+            raise RuntimeError("fixed attention is only available for the 0.8B CUDA shape")
+        key = ("attention_fixed", heads, groups, dim, cap, scale, self.device)
+        fn = self._cache.get(
+            key,
+            lambda heads=heads, groups=groups, dim=dim, cap=cap, scale=scale: (
+                _build_attention_fixed(heads, groups, dim, cap, scale, self.device)
+            ),
+        )
+        return fn(q, k, v, pos)
 
     def rope(self, x, cos, sin, pos, rope_dim):
         return _torch_rope(x, cos, sin, pos, rope_dim)
@@ -148,6 +193,28 @@ def _torch_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.silu(gate.float()) * up.float()
 
 
+def _torch_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+) -> torch.Tensor:
+    if q.ndim != 2 or k.ndim != 3 or v.ndim != 3:
+        raise ValueError("attention expects q (H, D), k/v (S, Hkv, D)")
+    heads, dim = q.shape
+    groups = k.shape[1]
+    qq = q.view(1, heads, 1, dim)
+    kk = k.permute(1, 0, 2).unsqueeze(0)
+    vv = v.permute(1, 0, 2).unsqueeze(0)
+    try:
+        return F.scaled_dot_product_attention(
+            qq, kk, vv, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=True
+        ).view(heads, dim)
+    except (RuntimeError, TypeError):
+        group = heads // groups
+        qg = q.view(groups, group, dim)
+        scores = torch.einsum("kgd,ksd->kgs", qg, k) * scale
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("kgs,ksd->kgd", probs, v).reshape(heads, dim)
+
+
 def _torch_rope(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch.Tensor, rope_dim: int
 ) -> torch.Tensor:
@@ -183,21 +250,25 @@ def _torch_gdn_decode(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Reference gated-delta-rule step (state is f32 and updated in place)."""
-    if q.shape != k.shape or q.shape != v.shape or q.ndim != 2:
-        raise ValueError("q/k/v must all be (heads, dim)")
-    heads, dim = q.shape
-    if state.shape != (heads, dim, dim):
-        raise ValueError(f"state shape {tuple(state.shape)} != {(heads, dim, dim)}")
+    if q.shape != k.shape or q.ndim != 2 or v.ndim != 2:
+        raise ValueError("q/k must be (key_heads, dim); v must be (value_heads, dim)")
+    heads_k, dim = q.shape
+    heads_v = v.shape[0]
+    if heads_v % heads_k:
+        raise ValueError("value_heads must be a multiple of key_heads")
+    if state.shape != (heads_v, dim, dim):
+        raise ValueError(f"state shape {tuple(state.shape)} != {(heads_v, dim, dim)}")
     qf = q.float()
     kf = k.float()
     vf = v.float()
     qn = qf * torch.rsqrt(qf.pow(2).sum(dim=-1, keepdim=True) + eps) * scale
     kn = kf * torch.rsqrt(kf.pow(2).sum(dim=-1, keepdim=True) + eps)
-    decayed = state * torch.exp(g.float()).view(heads, 1, 1)
-    recalled = torch.einsum("hdv,hd->hv", decayed, kn)
+    index = torch.arange(heads_v, device=q.device) // (heads_v // heads_k)
+    decayed = state * torch.exp(g.float()).view(heads_v, 1, 1)
+    recalled = torch.einsum("hdv,hd->hv", decayed, kn[index])
     delta = (vf - recalled) * torch.sigmoid(beta.float()).unsqueeze(-1)
-    state.copy_(decayed + kn.unsqueeze(-1) * delta.unsqueeze(-2))
-    return torch.einsum("hdv,hd->hv", state, qn)
+    state.copy_(decayed + kn[index].unsqueeze(-1) * delta.unsqueeze(-2))
+    return torch.einsum("hdv,hd->hv", state, qn[index])
 
 
 def _gdn_launch(heads: int, dim: int, device: str) -> tuple[int, int]:
@@ -449,10 +520,65 @@ class _CpuSiluMul:
         return run
 
 
-def _build_gdn_decode(heads: int, dim: int, scale: float, threads: int, lane_group: int):
+def _build_attention(heads: int, groups: int, dim: int, scale: float, device: str):
+    from breezetoken.kernels.cuda.attention import gqa_decode
+
+    num_split = 16
+    kernel = gqa_decode(heads, groups, dim, scale, num_split=num_split)
+
+    def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        seq = k.shape[0]
+        lse = torch.empty((1, heads, num_split), dtype=torch.float32, device=device)
+        part = torch.empty((1, heads, num_split, dim), dtype=torch.float32, device=device)
+        out = torch.empty((1, heads, dim), dtype=torch.float32, device=device)
+        kernel(
+            q.contiguous().view(1, heads, dim),
+            k.contiguous().view(1, seq, groups, dim),
+            v.contiguous().view(1, seq, groups, dim),
+            lse,
+            part,
+            out,
+        )
+        return out.view(heads, dim)
+
+    return run
+
+
+def _build_attention_fixed(heads: int, groups: int, dim: int, cap: int, scale: float, device: str):
+    from breezetoken.kernels.cuda.attention import gqa_decode_fixed
+
+    num_split = 16
+    kernel = gqa_decode_fixed(heads, groups, dim, cap, scale, num_split=num_split)
+
+    def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        lse = torch.empty((1, heads, num_split), dtype=torch.float32, device=device)
+        part = torch.empty((1, heads, num_split, dim), dtype=torch.float32, device=device)
+        out = torch.empty((1, heads, dim), dtype=torch.float32, device=device)
+        kernel(
+            q.contiguous().view(1, heads, dim),
+            k.view(1, cap, groups, dim),
+            v.view(1, cap, groups, dim),
+            pos.reshape(1).to(torch.int32),
+            lse,
+            part,
+            out,
+        )
+        return out.view(heads, dim)
+
+    return run
+
+
+def _build_gdn_decode(
+    heads_k: int,
+    heads_v: int,
+    dim: int,
+    scale: float,
+    threads: int,
+    lane_group: int,
+):
     from breezetoken.kernels.cuda.gdn import gdn_decode
 
-    kernel = gdn_decode(heads, dim, scale, threads, lane_group)
+    kernel = gdn_decode(heads_k, heads_v, dim, scale, threads, lane_group)
 
     def run(
         q: torch.Tensor,
@@ -463,14 +589,14 @@ def _build_gdn_decode(heads: int, dim: int, scale: float, threads: int, lane_gro
         state: torch.Tensor,
     ) -> torch.Tensor:
         out = kernel(
-            q.contiguous().view(1, 1, heads, dim),
-            k.contiguous().view(1, 1, heads, dim),
-            v.contiguous().view(1, 1, heads, dim),
-            g.contiguous().view(1, 1, heads),
-            beta.contiguous().view(1, 1, heads),
-            state.view(1, heads, dim, dim),
+            q.contiguous().view(1, 1, heads_k, dim),
+            k.contiguous().view(1, 1, heads_k, dim),
+            v.contiguous().view(1, 1, heads_v, dim),
+            g.contiguous().view(1, 1, heads_v),
+            beta.contiguous().view(1, 1, heads_v),
+            state.view(1, heads_v, dim, dim),
         )
-        return out.view(heads, dim)
+        return out.view(heads_v, dim)
 
     return run
 
@@ -503,6 +629,14 @@ class TilelangBackend(Backend):
             return fn(x, w)
         return _torch_linear(x, w)
 
+    def linear_batch(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        K, _ = w.shape
+        if x.shape[-1] != K:
+            raise ValueError(f"linear_batch shape mismatch: {tuple(x.shape)} x {tuple(w.shape)}")
+        if self._family == "cuda" and w.dtype == torch.bfloat16:
+            return (x.to(torch.bfloat16) @ w).float()
+        return x.float() @ w.float()
+
     def rms_norm(self, x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
         N = x.shape[-1]
         if w.numel() != N:
@@ -519,6 +653,57 @@ class TilelangBackend(Backend):
             out = fn(x.reshape(rows, N).contiguous(), w.reshape(-1))
             return out.reshape(x.shape)
         return _torch_rms_norm(x, w, eps)
+
+    def attention(self, q, k, v, scale):
+        heads, dim = q.shape
+        groups = k.shape[1]
+        servable = (
+            self._family == "cuda"
+            and q.dtype == torch.float32
+            and k.dtype == torch.float32
+            and v.dtype == torch.float32
+            and heads == 8
+            and groups == 2
+            and dim == 256
+            and k.shape[2] == dim
+            and v.shape == k.shape
+        )
+        if servable:
+            key = ("attention", heads, groups, dim, scale, self.device)
+            fn = self._cache.get(
+                key,
+                lambda heads=heads, groups=groups, dim=dim, scale=scale: _build_attention(
+                    heads, groups, dim, scale, self.device
+                ),
+            )
+            return fn(q, k, v)
+        return _torch_attention(q, k, v, scale)
+
+    def attention_fixed(self, q, k, v, pos, scale):
+        """Fixed-capacity attention used inside the CUDA graph (CUDA only)."""
+        heads, dim = q.shape
+        groups = k.shape[1]
+        cap = k.shape[0]
+        if not (
+            self._family == "cuda"
+            and q.dtype == torch.float32
+            and k.dtype == torch.float32
+            and v.dtype == torch.float32
+            and heads == 8
+            and groups == 2
+            and dim == 256
+            and k.shape == (cap, groups, dim)
+            and v.shape == k.shape
+        ):
+            raise RuntimeError("fixed attention is only available for the 0.8B CUDA shape")
+        key = ("attention_fixed", heads, groups, dim, cap, scale, self.device)
+        fn = self._cache.get(
+            key,
+            lambda heads=heads, groups=groups, dim=dim, cap=cap, scale=scale: (
+                _build_attention_fixed(heads, groups, dim, cap, scale, self.device)
+            ),
+        )
+        return fn(q, k, v, pos)
 
     def rope(self, x, cos, sin, pos, rope_dim):
         dim = x.shape[-1]
@@ -586,25 +771,30 @@ class TilelangBackend(Backend):
         scale: float,
         eps: float = 1e-6,
     ) -> torch.Tensor:
-        heads, dim = q.shape
+        heads_k, dim = q.shape
+        heads_v = v.shape[0]
         servable = (
             self._family == "cuda"
             and q.dtype == torch.float32
             and k.dtype == torch.float32
             and v.dtype == torch.float32
             and state.dtype == torch.float32
-            and state.shape == (heads, dim, dim)
+            and k.shape == q.shape
+            and v.shape == (heads_v, dim)
+            and heads_v > 0
+            and heads_v % heads_k == 0
+            and state.shape == (heads_v, dim, dim)
             and dim in (64, 128)
             and eps == 1e-6
             and state.is_contiguous()
         )
         if servable:
-            threads, lane_group = _gdn_launch(heads, dim, self.device)
-            key = ("gdn", heads, dim, scale, threads, lane_group, self.device)
+            threads, lane_group = _gdn_launch(heads_v, dim, self.device)
+            key = ("gdn", heads_k, heads_v, dim, scale, threads, lane_group, self.device)
             fn = self._cache.get(
                 key,
-                lambda heads=heads, dim=dim, scale=scale, threads=threads, lane=lane_group: (
-                    _build_gdn_decode(heads, dim, scale, threads, lane)
+                lambda heads_k=heads_k, heads_v=heads_v, dim=dim, scale=scale, threads=threads, lane=lane_group: (
+                    _build_gdn_decode(heads_k, heads_v, dim, scale, threads, lane)
                 ),
             )
             return fn(q, k, v, g, beta, state)

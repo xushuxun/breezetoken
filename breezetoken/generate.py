@@ -39,8 +39,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--backend", choices=["auto", "torch", "tilelang"], default="auto")
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "torch", "tilelang"],
+        default="auto",
+        help="auto (GPU tilelang + CPU torch placement); explicit values are debug overrides",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto (hybrid placement); explicit cpu/cuda overrides disable the planner",
+    )
     parser.add_argument(
         "--dtype", default=None, help="auto, float32, bfloat16 (tilelang CUDA: bfloat16)"
     )
@@ -118,7 +127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ttft = (first_token_at - gen_started) if first_token_at is not None else total
         rate = token_count / total if total > 0 else 0.0
         print(
-            f"\n[{engine.model_id} | {engine.model.backend.name}/{engine.model.device} | "
+            f"\n[{engine.model_id} | {engine.summary} | "
             f"load {load_seconds:.1f}s | prefill+first {ttft * 1e3:.0f}ms | "
             f"{token_count} tokens, {rate:.2f} tok/s]",
             file=sys.stderr,

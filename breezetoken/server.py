@@ -351,11 +351,27 @@ def create_app(settings: Settings, engine: Engine | None = None) -> FastAPI:
     @app.get("/healthz")
     async def health(request: Request) -> dict[str, Any]:
         current = _engine(request)
+        summary = getattr(current, "summary", None)
+        backend = getattr(current, "backend_name", None)
+        device = getattr(current, "device_name", None)
+        gpu_layers = getattr(current, "gpu_layers", None)
+        if summary is None:
+            placement = getattr(current.model, "placement", None)
+            summary = (
+                placement.summary(current.model.cfg.n_layers)
+                if placement is not None
+                else f"{current.model.backend.name}/{current.model.device}"
+            )
+            backend = backend or current.model.backend.name
+            device = device or current.model.device
+            gpu_layers = gpu_layers if gpu_layers is not None else 0
         return {
             "status": "ok",
             "model": current.model_id,
-            "backend": current.model.backend.name,
-            "device": current.model.device,
+            "backend": backend,
+            "device": device,
+            "placement": summary,
+            "gpu_layers": gpu_layers,
             "max_context": current.max_context,
             "max_new_tokens": request.app.state.settings.max_new_tokens,
         }
@@ -566,8 +582,17 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("BREEZETOKEN_MODEL"),
         help="path to a Qwen3.5 GGUF file (or set BREEZETOKEN_MODEL)",
     )
-    parser.add_argument("--backend", choices=["auto", "torch", "tilelang"], default="auto")
-    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "torch", "tilelang"],
+        default="auto",
+        help="auto (GPU tilelang + CPU torch placement); explicit values are debug overrides",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto (hybrid placement); explicit cpu/cuda overrides disable the planner",
+    )
     parser.add_argument("--dtype", default=None)
     parser.add_argument("--max-context", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=4096)

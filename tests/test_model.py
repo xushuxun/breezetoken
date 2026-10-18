@@ -87,3 +87,12 @@ def test_cancel_mid_generation(torch_model: Qwen35, tokenizer) -> None:
     assert isinstance(first, int)
     cancel.set()
     assert list(stream) == []
+
+
+def test_batched_prefill_matches_eager(torch_model: Qwen35, tokenizer, monkeypatch) -> None:
+    ids = tokenizer.encode("Write a Python function to add two numbers:")
+    assert len(ids) >= 8
+    batched = torch_model.generate(ids, 4, 0.0, eos_ids=tokenizer.eos_ids)
+    monkeypatch.setattr("breezetoken.model.qwen35._PREFILL_BATCH_MIN", 10**9)
+    eager = torch_model.generate(ids, 4, 0.0, eos_ids=tokenizer.eos_ids)
+    assert batched == eager

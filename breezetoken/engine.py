@@ -38,6 +38,15 @@ class Engine:
         if not path.is_file():
             raise FileNotFoundError(f"GGUF model not found: {path}")
         with GGUFFile(path) as gguf:
+            arch = gguf.arch
+            native_quant = all(
+                gguf.tensor_info(name)[1] in ("f32", "q8_0") for name in gguf.tensor_names()
+            )
+            if arch != "qwen35" or not native_quant:
+                raise NotImplementedError(
+                    f"{arch} / non-Q8 GGUF is not supported by the native engine yet; "
+                    "see docs/qwen36_35b_plan.md for the native IQ3_S/MoE plan"
+                )
             tokenizer = BPETokenizer(gguf)
             model = Qwen35(
                 gguf,
@@ -109,8 +118,24 @@ class Engine:
     def close(self) -> None:
         self.model.close()
 
+    @property
+    def summary(self) -> str:
+        return self.model.placement.summary(self.model.cfg.n_layers)
+
+    @property
+    def backend_name(self) -> str:
+        return self.model.backend.name
+
+    @property
+    def device_name(self) -> str:
+        return self.model.device
+
+    @property
+    def gpu_layers(self) -> int:
+        return self.model.placement.gpu_layers
+
     def __repr__(self) -> str:
         return (
-            f"Engine(model={self.model_id!r}, backend={self.model.backend.name}, "
-            f"device={self.model.device!r}, max_context={self.max_context})"
+            f"Engine(model={self.model_id!r}, placement={self.summary}, "
+            f"max_context={self.max_context})"
         )

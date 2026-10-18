@@ -118,3 +118,94 @@ def test_cuda_rope_matches_torch() -> None:
     assert torch.allclose(got, ref, atol=1e-5)
     ref_backend.close()
     kernel_backend.close()
+
+
+@cuda
+@pytest.mark.skipif(
+    os.environ.get("BREEZETOKEN_TEST_CUDA") != "1",
+    reason="set BREEZETOKEN_TEST_CUDA=1 to load the full model",
+)
+def test_auto_and_hybrid_placement_match_golden(model_path, tokenizer) -> None:
+    pytest.importorskip("tilelang")
+    from breezetoken.gguf import GGUFFile
+
+    ids = tokenizer.encode("The capital of France is")
+    with GGUFFile(model_path) as gguf:
+        auto = Qwen35(gguf, max_context=512)
+    try:
+        assert auto.placement.gpu_layers == auto.cfg.n_layers
+        assert auto.generate(ids, 4, 0.0, eos_ids=tokenizer.eos_ids) == [
+            11751,
+            13,
+            198,
+            760,
+        ]
+        assert auto._graph is not None
+        long_ids = tokenizer.encode("Write a Python function to add two numbers:")
+        assert auto.generate(long_ids, 4, 0.0, eos_ids=tokenizer.eos_ids) == [
+            198,
+            16,
+            13,
+            561,
+        ]
+    finally:
+        auto.close()
+
+    with GGUFFile(model_path) as gguf:
+        hybrid = Qwen35(gguf, max_context=512, max_gpu_layers=1)
+    try:
+        assert 0 < hybrid.placement.gpu_layers < hybrid.cfg.n_layers
+        long_ids = tokenizer.encode("Write a Python function to add two numbers:")
+        assert hybrid.generate(long_ids, 4, 0.0, eos_ids=tokenizer.eos_ids) == [
+            198,
+            16,
+            13,
+            561,
+        ]
+    finally:
+        hybrid.close()
+
+
+@cuda
+def test_cuda_gdn_decode_grouped_heads() -> None:
+    pytest.importorskip("tilelang")
+    from breezetoken.backends import make_backend
+
+    torch.manual_seed(5)
+    heads_k, heads_v, dim = 8, 16, 128
+    q = torch.randn(heads_k, dim, device="cuda")
+    k = torch.randn(heads_k, dim, device="cuda")
+    v = torch.randn(heads_v, dim, device="cuda")
+    g = torch.randn(heads_v, device="cuda") * 0.1
+    beta = torch.randn(heads_v, device="cuda")
+    state_ref = torch.randn(heads_v, dim, dim, device="cuda")
+    state = state_ref.clone()
+    scale = dim**-0.5
+    ref_backend = make_backend("torch", "cuda")
+    kernel_backend = make_backend("tilelang", "cuda")
+    ref = ref_backend.gdn_decode(q, k, v, g, beta, state_ref, scale)
+    got = kernel_backend.gdn_decode(q, k, v, g, beta, state, scale)
+    assert torch.allclose(got, ref, atol=1e-5)
+    assert torch.allclose(state, state_ref, atol=1e-5)
+    ref_backend.close()
+    kernel_backend.close()
+
+
+@cuda
+def test_cuda_attention_matches_torch() -> None:
+    pytest.importorskip("tilelang")
+    from breezetoken.backends import make_backend
+
+    torch.manual_seed(6)
+    heads, groups, dim = 8, 2, 256
+    ref_backend = make_backend("torch", "cuda")
+    kernel_backend = make_backend("tilelang", "cuda")
+    for seq in (1, 17, 128):
+        q = torch.randn(heads, dim, device="cuda")
+        k = torch.randn(seq, groups, dim, device="cuda")
+        v = torch.randn(seq, groups, dim, device="cuda")
+        ref = ref_backend.attention(q, k, v, dim**-0.5)
+        got = kernel_backend.attention(q, k, v, dim**-0.5)
+        assert (got - ref).abs().max().item() < 3e-3
+    ref_backend.close()
+    kernel_backend.close()

@@ -1495,7 +1495,7 @@ name = "torch-c-dlpack-ext"
 version = "0.1.5"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
 dependencies = [
-    { name = "torch" },
+    { name = "torch", marker = "python_full_version < '3.14'" },
 ]
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz", hash = "sha256:d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe" }
 wheels = [
